@@ -1,0 +1,55 @@
+[workspace]
+name = "PhonoP2C-env"
+version = "0.1.0"
+description = "Deep Learning Environment"
+channels = ["conda-forge", "nvidia"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = ">=3.13,<3.14"
+cuda-runtime = ">=13.0,<13.1"
+setuptools = ">=82.0.1,<83"
+pip = "*"
+
+[pypi-dependencies]
+jieba = "*"
+torch = { version = "*", index = "https://download.pytorch.org/whl/nightly/cu130" }
+torchvision = { version = "*", index = "https://download.pytorch.org/whl/nightly/cu130" }
+triton = { version = "*", index = "https://download.pytorch.org/whl/nightly/cu130" }
+torchao = { version = "*", index = "https://download.pytorch.org/whl/nightly/cu130" }
+mslk = { version = "*", index = "https://download.pytorch.org/whl/nightly/cu130" }
+executorch = "*"
+bitsandbytes = "*"
+
+pypinyin = "*"
+netcal = "*"
+optuna = "*"
+opencc = "*"
+zhconv-rs = "*"
+
+transformers = "*"
+datasets = "*"
+mosaicml-streaming = "*"
+pyarrow = "*"
+numpy = "*"
+tqdm = "*"
+rich = "*"
+wandb = "*"
+hydra-core = "*"
+
+black = "*"
+isort = "*"
+flake8 = "*"
+mypy = "*"
+pre-commit = "*"
+
+
+[tasks]
+jupyter = "jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root"
+format = "black . && isort ."
+lint = "flake8 . && mypy ."
+test = "pytest"
+
+[environments]
+default = { features = [], solve-group = "default" }
+

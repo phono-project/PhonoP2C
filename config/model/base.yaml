@@ -1,0 +1,19 @@
+common:
+  model_dim: 768
+  rope_theta: 1000.0
+
+pre_model:
+  max_seqlen: 128
+  mhsa_layers: 8
+  mhsa_heads: 4
+  attn_dim: 256
+  ffn_common_dim: 4096
+
+post_model:
+  max_seqlen: 32
+  mhsa_layers: 12
+  mhsa_heads: 4
+  attn_dim: 256
+  mhca_heads: 12
+  mhca_attn_dim: 768
+  ffn_common_dim: 4096

@@ -1,0 +1,8 @@
+defaults:
+  - model: base
+  - dataset: pretrain_v1
+  - system: default
+  - task: train
+  - logging: train
+  - output: default
+  - _self_

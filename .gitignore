@@ -1,0 +1,17 @@
+__pycache__
+.pixi
+pixi.lock
+datasets
+tests
+logs
+wandb
+checkpoints
+target
+legacy
+outputs
+models
+exports
+export_output
+.vscode
+test
+param_search_output

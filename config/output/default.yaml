@@ -1,0 +1,31 @@
+progress_bar:
+  # Bar width in characters; null = auto-fit terminal width.
+  bar_width: null
+
+  # Refresh rate (Hz). Higher values look smoother but use more CPU.
+  refresh_per_second: 10
+
+  # Show elapsed time column.
+  show_time_elapsed: true
+
+  # Show estimated time remaining column.
+  show_time_remaining: true
+
+  # Show speed column.
+  show_speed: true
+
+  # Show ratio column.
+  show_ratio: true
+
+  # When true Rich progress bars disappear after completion.
+  # When false they leave a persistent trace.
+  transient: true
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging:
+  # Minimum log level for Python's logging module.
+  # One of: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  # Or:     DEFAULT to keep unchanged.
+  log_level: "ERROR"

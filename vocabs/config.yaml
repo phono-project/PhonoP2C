@@ -1,0 +1,6 @@
+vocabs:
+  chinese_vocab: chinese_vocab.txt
+  context_vocab: context_vocab.txt
+  pinyin_vocab: pinyin_vocab.txt
+  context_special_tokens:
+    - bos_token

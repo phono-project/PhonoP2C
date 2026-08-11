@@ -1,0 +1,20 @@
+dataset_dir: "./datasets/pretrain_v1"
+vocabs_config: "./vocabs/config.yaml"
+train_dir_mds: "${dataset.dataset_dir}/train"
+val_dir: "${dataset.dataset_dir}/val"
+
+augmentation:
+  drop_vowels: 0.2
+  drop_last_vowel: 0.3
+  vowels_droprate: [0.5, 1.0]
+  heteronym_confusion: 0.1
+
+online_policy:
+  strategy: "golden-sequence"
+  no_context_prob: 0.2
+  forward_ratio: 0.0
+
+shuffle:
+  algo: py1e
+  blocksize: 200000000000
+  cache_limit: 140gb
