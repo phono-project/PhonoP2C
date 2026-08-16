@@ -7,13 +7,13 @@ pre_model:
   mhsa_layers: 8
   mhsa_heads: 4
   attn_dim: 256
-  ffn_common_dim: 4096
+  mhca_attn_dim: 256
+  ffn_common_dim: 2048
 
 post_model:
   max_seqlen: 32
-  mhsa_layers: 12
+  mhsa_layers: 4
   mhsa_heads: 4
   attn_dim: 256
-  mhca_heads: 12
-  mhca_attn_dim: 768
-  ffn_common_dim: 4096
+  mhca_heads: 4
+  ffn_common_dim: 2048

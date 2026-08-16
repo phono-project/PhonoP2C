@@ -153,3 +153,42 @@ class MetricsAccumulator:
     def __len__(self) -> int:
         """Number of tokens accumulated (proxy for batches seen)."""
         return self._total_tokens
+
+
+class TopKSentenceAccuracy:
+    """Top-K sentence accuracy from beam-search hypotheses.
+
+    A sentence counts as correct when its target id sequence appears among
+    the top-K decoded hypotheses.
+
+    Usage::
+
+        acc = TopKSentenceAccuracy(k=3)
+        for beams, target in ...:
+            acc.update(beams, target)   # beams: list[list[list[int]]]
+        top3_s_acc = acc.compute()
+    """
+
+    def __init__(self, k: int = 3):
+        self.k = k
+        self.reset()
+
+    def update(self, beams: list[list[list[int]]], target: list[int]) -> None:
+        """Ingest one sample.
+
+        Args:
+            beams: the (up to k) decoded id sequences for one sentence.
+            target: the ground-truth id sequence.
+        """
+        self._total_sentences += 1
+        if any(list(hyp) == list(target) for hyp in beams[: self.k]):
+            self._correct_sentences += 1
+
+    def compute(self) -> float:
+        if self._total_sentences == 0:
+            return 0.0
+        return self._correct_sentences / self._total_sentences
+
+    def reset(self) -> None:
+        self._total_sentences = 0
+        self._correct_sentences = 0

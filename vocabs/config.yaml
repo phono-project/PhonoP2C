@@ -2,5 +2,6 @@ vocabs:
   chinese_vocab: chinese_vocab.txt
   context_vocab: context_vocab.txt
   pinyin_vocab: pinyin_vocab.txt
+  characters_pronounce_frequency: characters_pronounce_frequency.json
   context_special_tokens:
     - bos_token

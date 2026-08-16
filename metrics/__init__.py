@@ -1,3 +1,3 @@
-from .accumulator import MetricsAccumulator
+from .accumulator import MetricsAccumulator, TopKSentenceAccuracy
 
-__all__ = ["MetricsAccumulator"]
+__all__ = ["MetricsAccumulator", "TopKSentenceAccuracy"]

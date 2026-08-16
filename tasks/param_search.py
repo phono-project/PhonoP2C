@@ -27,8 +27,9 @@ from tqdm import tqdm
 from algo.trie import load_dictionary, build_trie, find_matching_words
 from algo.viterbi_dp import viterbi_nbest
 from model.model import PhonoP2CPreModel, PhonoP2CPostModel
+from model.utils import gather_target_logits
 from tokenizer import P2CTokenizer
-from dataset import make_collate_fn, create_dataset, transform_pinyin_predict_val
+from datasets_pipeline import make_collate_fn, create_dataset, transform_pinyin_predict_val
 
 
 import concurrent.futures
@@ -190,38 +191,52 @@ class ParamSearchRunner:
 
         with open(probs_path, "w", encoding="utf-8") as f_out, torch.no_grad():
             for batch_idx, batch in enumerate(val_loader):
-                prefix_njt = batch["prefix_ids_njt"].to(self.device)
+                pre_njt = batch["pre_ids_njt"].to(self.device)
                 postfix_njt = batch["postfix_ids_njt"].to(self.device)
                 target_njt = batch["target_ids_njt"].to(self.device)
 
-                flat_prefix_ids = prefix_njt.values()
-                prefix_offsets = prefix_njt.offsets()
+                flat_pre_ids = pre_njt.values()
+                pre_offsets = pre_njt.offsets()
                 flat_postfix_ids = postfix_njt.values()
                 postfix_offsets = postfix_njt.offsets()
 
-                prefix_seq_lens = prefix_offsets[1:] - prefix_offsets[:-1]
-                min_sl_pre = int(prefix_seq_lens.min().item())
-                max_sl_pre = int(prefix_seq_lens.max().item())
+                pre_seq_lens = pre_offsets[1:] - pre_offsets[:-1]
+                min_sl_pre = int(pre_seq_lens.min().item())
+                max_sl_pre = int(pre_seq_lens.max().item())
 
                 postfix_seq_lens = postfix_offsets[1:] - postfix_offsets[:-1]
                 min_sl_post = int(postfix_seq_lens.min().item())
                 max_sl_post = int(postfix_seq_lens.max().item())
 
                 with torch.amp.autocast(self.device.type, dtype=torch.bfloat16, enabled=use_amp):
-                    _, pre_K, pre_V = pre_model(
-                        flat_prefix_ids, offsets=prefix_offsets,
+                    _, past_kv = pre_model(
+                        flat_pre_ids, offsets=pre_offsets,
                         min_seqlen=min_sl_pre, max_seqlen=max_sl_pre,
                     )
-                    logits_njt = post_model(
+                    post_hidden, post_mask = post_model(
                         flat_postfix_ids, input_offsets=postfix_offsets,
-                        pre_K=pre_K, pre_V=pre_V, pre_offsets=prefix_offsets,
                         min_seqlen=min_sl_post, max_seqlen=max_sl_post,
-                        min_seqlen_pre=min_sl_pre, max_seqlen_pre=max_sl_pre,
                     )
+                    logits_cond_njt, _ = pre_model(
+                        flat_pre_ids, offsets=pre_offsets,
+                        min_seqlen=min_sl_pre, max_seqlen=max_sl_pre,
+                        past_kv=past_kv,
+                        post_hidden=post_hidden, post_offsets=postfix_offsets,
+                        min_seqlen_post=min_sl_post, max_seqlen_post=max_sl_post,
+                        logits_mask=post_mask,
+                    )
+
+                # Target-aligned conditional logits
+                flat_cond = gather_target_logits(
+                    logits_cond_njt.values(), pre_offsets, postfix_offsets
+                )
+                cond_njt = torch.nested.nested_tensor_from_jagged(
+                    flat_cond, postfix_offsets, min_seqlen=min_sl_post, max_seqlen=max_sl_post
+                )
 
                 # Split NJT into per-sample tensors
                 for sample_logits, sample_target in zip(
-                    logits_njt.unbind(), target_njt.unbind()
+                    cond_njt.unbind(), target_njt.unbind()
                 ):
                     l_cpu = sample_logits.cpu()
                     t_cpu = sample_target.cpu()

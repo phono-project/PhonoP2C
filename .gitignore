@@ -2,7 +2,6 @@ __pycache__
 .pixi
 pixi.lock
 datasets
-tests
 logs
 wandb
 checkpoints

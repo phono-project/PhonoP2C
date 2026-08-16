@@ -1,8 +1,8 @@
-epochs: 15
+epochs: 10
 batchsize: 1280
 optimizer: "adamw"    # "adamw" or "ademamix"
 learning_rate: 2e-4
-weight_decay: 1e-2
+weight_decay: 1e-3
 warmup_steps: 10000
 gradient_clip_val: 1.0
 compile_model: true
@@ -17,6 +17,10 @@ focal_loss_alpha: 0.5
 # validation
 ece_bins: 15
 ece_top_k: 5
+
+# Beam search sentence-accuracy metric (top-K sentence accuracy).
+beam_width: 3
+beam_search_max_samples: 256
 
 # Task type is Train.
 task_type: "train"

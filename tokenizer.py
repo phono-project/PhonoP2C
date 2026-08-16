@@ -6,8 +6,10 @@ Three-vocabulary tokenizer with Chinese/pinyin/context separation.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import random
 from types import SimpleNamespace
 from typing import Optional, Union
 
@@ -21,6 +23,36 @@ _SIMPLE_INITIALS = {
     "zh", "ch", "sh", "r", "z", "c", "s",
     "y", "w",
 }
+
+_COMP_CONSONANTS = {"zh", "ch", "sh"}
+_SINGLE_INITIALS = {i for i in _SIMPLE_INITIALS if len(i) == 1}
+
+
+def get_initial_and_final(syllable: str) -> tuple[str, str]:
+    """Split a pinyin syllable into (initial, final) parts."""
+    if len(syllable) >= 2 and syllable[:2] in _COMP_CONSONANTS:
+        return syllable[:2], syllable[2:]
+    if syllable and syllable[0] in _SINGLE_INITIALS:
+        return syllable[0], syllable[1:]
+    return "", syllable
+
+
+def simple_initial_candidates(syllable: str) -> list[str]:
+    """Return the valid 简拼 (simple-initial) forms of a pinyin syllable.
+
+    Syllables *without* an initial (e.g. "ai", "ao", "an") previously yielded
+    nothing from prefix splitting; now their first letter is used as the
+    shorthand form.
+    """
+    initial, _ = get_initial_and_final(syllable)
+    if initial:
+        candidates = [initial]
+        if len(initial) == 2:
+            candidates.append(initial[0])
+        return candidates
+    if syllable:
+        return [syllable[0]]
+    return []
 
 
 def _read_vocab_tokens(path: str) -> list[str]:
@@ -127,6 +159,11 @@ class P2CTokenizer:
         self._context_size += self._num_special
         self._id_to_context = {i: ch for ch, i in self._context_vocab.items()}
 
+        # Per-character pronunciation frequencies (part of the tokenizer).
+        # {char: {pinyin: probability}} normalized to sum to 1.
+        self._char_pinyin_freq: dict[str, dict[str, float]] = {}
+        self._char_pinyin_freq_path: Optional[str] = None
+
     # Class methods
     @classmethod
     def from_config(cls, config_path: str) -> "P2CTokenizer":
@@ -153,7 +190,19 @@ class P2CTokenizer:
         pinyin_path = os.path.join(config_dir, vocabs["pinyin_vocab"])
         special_tokens_def = vocabs.get("context_special_tokens", None)
 
-        return cls(chinese_path, context_path, pinyin_path, special_tokens_def)
+        tokenizer = cls(chinese_path, context_path, pinyin_path, special_tokens_def)
+
+        # Optional per-character pronunciation frequencies.
+        freq_rel = vocabs.get("characters_pronounce_frequency", None)
+        if freq_rel:
+            freq_path = os.path.join(config_dir, freq_rel)
+            if os.path.exists(freq_path):
+                tokenizer.load_character_pinyin_frequency(freq_path)
+            else:
+                logging.warning(
+                    "characters_pronounce_frequency file not found: %s", freq_path
+                )
+        return tokenizer
 
     # Vocabulary sizes
     @property
@@ -181,6 +230,49 @@ class P2CTokenizer:
     @property
     def num_special_tokens(self) -> int:
         return self._num_special
+
+    # Heteronym sampling
+    def load_character_pinyin_frequency(self, path: str) -> None:
+        """Load the per-character pronunciation frequency JSON.
+
+        Expected format: ``{char: {pinyin: probability, ...}, ...}`` with
+        probabilities normalized to sum to 1 per character.
+        """
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        self._char_pinyin_freq = {
+            str(ch): {str(py): float(p) for py, p in readings.items()}
+            for ch, readings in raw.items()
+        }
+        self._char_pinyin_freq_path = path
+
+    @property
+    def character_pinyin_frequency(self) -> dict[str, dict[str, float]]:
+        return self._char_pinyin_freq
+
+    def sample_heteronym(self, ch: str, rng: Optional[random.Random] = None) -> Optional[str]:
+        """Sample a pronunciation for Chinese char *ch* by corpus frequency.
+
+        Uses the probabilities in characters_pronounce_frequency (a part of
+        the tokenizer).  Characters without recorded frequencies fall back to
+        pypinyin's most probable reading.  Returns None when no reading is
+        obtainable.
+        """
+        freqs = self._char_pinyin_freq.get(ch)
+        if freqs:
+            rng = rng or random
+            choices = list(freqs.keys())
+            weights = [freqs[c] for c in choices]
+            return rng.choices(choices, weights=weights, k=1)[0]
+
+        from pypinyin import pinyin, Style
+
+        matrix = pinyin(ch, heteronym=False, strict=False,
+                        errors="ignore", style=Style.NORMAL, v_to_u=False)
+        if not matrix or not matrix[0]:
+            return None
+        sounds = [s for s in matrix[0] if s != "ê"]
+        return sounds[0] if sounds else None
 
     # Encoding methods
     def encode_context(self, text: str) -> list[int]:
@@ -357,13 +449,12 @@ class P2CTokenizer:
                 if pos_py in self._pinyin_vocab:
                     pid = self._pinyin_vocab[pos_py]
                     mask[pid, cid] = True
-                
-                # Match simple initials (简拼)
-                # Check all possible prefixes of the current pinyin
-                for i in range(1, min(3, len(pos_py) + 1)):
-                    prefix = pos_py[:i]
-                    if prefix in _SIMPLE_INITIALS and prefix in self._pinyin_vocab:
-                        pid = self._pinyin_vocab[prefix]
+
+                # Match simple initials (简拼): the syllable's initial letter(s);
+                # syllables without an initial use their first letter instead.
+                for candidate in simple_initial_candidates(pos_py):
+                    if candidate in self._pinyin_vocab:
+                        pid = self._pinyin_vocab[candidate]
                         mask[pid, cid] = True
 
         return mask

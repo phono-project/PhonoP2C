@@ -1,0 +1,77 @@
+# Merged dataset + preprocessor configuration (pretrain_v2).
+#
+# Used both by the preprocess task (corpus -> MDS/Arrow datasets) and the
+# train task (dataset paths, online policy, augmentation).
+
+dataset_dir: "./datasets/pretrain_v2"
+vocabs_config: "./vocabs/config.yaml"
+train_dir_mds: "${dataset.dataset_dir}/train"
+val_dir: "${dataset.dataset_dir}/val"
+
+# Chinese segmentation: "char" = one segment per character, "word" = one
+# segment per jieba word.  In both modes jieba word detection is still used
+# for pronunciation disambiguation.
+segmentation:
+  mode: "char"
+
+sources:
+  jsonl:
+    - "./datasets/pretrain_base/LCCC"
+    - "./datasets/pretrain_base/MMC"
+  textonly:
+    - "./datasets/pretrain_base/CLUE"
+  parquet:
+    - path: "./datasets/pretrain_base/zhihu-kol"
+      columns: ["INSTRUCTION", "RESPONSE"]
+
+sampling:
+  truncation_len_min: 16      # Min sample length (chars) target
+  truncation_len_max: 64      # Max sample length (chars) target
+  max_text_len: 72            # Max text length (chars) in sample
+  ban_text_len: 96            # Drop segments longer than this (chars)
+  max_non_chinese_seg_len: 16 # Non-Chinese segments longer than this are dropped
+  min_chinese_ratio: 0.5      # Minimum ratio of Chinese characters in a segment
+  split_ratio: 0.995          # Train/val split ratio
+
+output:
+  train_dir: "${dataset.dataset_dir}/train"
+  val_dir: "${dataset.dataset_dir}/val"
+  val_original_dir: "${dataset.dataset_dir}/val_original"
+  train_original_dir: "${dataset.dataset_dir}/train_original"
+  num_val_shards: 1
+  num_original_shards: 15
+
+mds:
+  compression: "zstd"         # set to null to disable compression
+  size_limit: 268435456       # ~256MB per shard
+
+# Static augmentation applied while materializing the validation set.
+val_augmentation:
+  drop_vowels: 0.2
+  drop_last_vowel: 0.3
+  vowels_droprate: [0.5, 1.0]
+  heteronym_confusion: 0.1
+  no_context_prob: 0.2
+  forward_ratio: 0.0
+
+# Online augmentation / sampling policy used by the train dataloader.
+augmentation:
+  drop_vowels: 0.2
+  drop_last_vowel: 0.3
+  vowels_droprate: [0.5, 1.0]
+  heteronym_confusion: 0.1
+
+online_policy:
+  strategy: "golden-sequence"
+  no_context_prob: 0.2
+  forward_prob: 0.0
+
+shuffle:
+  algo: py1e
+  blocksize: 200000000000
+  cache_limit: 140gb
+
+processing:
+  num_proc: 15
+  batch_size: 8
+  shuffle_seed: 114514

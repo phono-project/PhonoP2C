@@ -1,32 +1,85 @@
 """
-PostfixLM hybrid model: PhonoP2CPreModel + PhonoP2CPostModel.
+New-standard encoder-decoder PhonoP2C model.
 
-  ┌──────────────────────┐    pre_K / pre_V    ┌──────────────────────┐
-  │  PhonoP2CPreModel    │─────────────────────│  PhonoP2CPostModel   │
-  │  (causal)            │   cross-attention   │  (bidirectional)     │
-  │  Chinese context     │     (shared KV)     │  Pinyin -> Chinese   │
-  │  encoder + KV proj   │                     │  decoder             │
-  └──────────────────────┘                     └──────────────────────┘
+    ┌──────────────────────┐        hidden + mask        ┌──────────────────────┐
+    │  PhonoP2CPostModel   │─────────────────────────────│  PhonoP2CPreModel    │
+    │  (bidirectional)     │   cross-attention (K/V)     │  (causal decoder)    │
+    │  pinyin encoder      │                             │  Chinese -> logits   │
+    └──────────────────────┘                             └──────────────────────┘
+
+The pre model is the *decoder*: it reads the Chinese sequence (context prefix
++ target, teacher-forced during training), performs causal self-attention and —
+in the second pass — cross-attention over the pinyin encoder's hidden states.
+Its ``lm_proj`` produces logits over the *chinese* vocabulary.
+
+The post model is the *encoder*: it reads the pinyin sequence bidirectionally
+and yields its hidden states plus a per-position logits mask.  It does not
+output logits.  In the cross-attention, encoder position ids are placed after
+the decoder sequence (RoPE).
+
+Two-pass training semantics (NJT path, used in train + validation):
+
+    pass 1 (no post hidden states):  self-attn output goes straight to the
+        FFN (cross-attn layer skipped, cross KV projector unused).  The model
+        returns its logits (unconditional) together with the pre-RoPE
+        self-attn K/V, packed into a single nested jagged tensor with a layer
+        axis ([B, j1, L, 2, H, D]).
+    pass 2 (post hidden states + past self-attn K/V + logits mask provided):
+        each layer runs self-attn (queries recomputed, K/V taken from the
+        first pass), then cross-attention over the encoder hidden states,
+        then the FFN.  Logits are masked with the provided logits mask.
+
+The non-NJT (batched) path mirrors this, except the self-attn KV cache is
+updated in place and ``current_seqlen[B]`` tracks the cache fill level
+(batchsize is usually > 1; the post model's non-NJT path usually runs with
+batchsize 1).
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.utils.checkpoint
 from transformers import PreTrainedModel
 
 from model.config import PreModelConfig, PostModelConfig
 from model.attn import MHSALayer, MHCALayer
 from model.ffn import SwiGLU
 from model.moe import MoE_EC_FFN
-from model.utils import make_local_position_ids
-from model.custom_ops import kv_cache_write, update_cross_kv, update_mhsa_kv
+from model.utils import (
+    make_local_position_ids,
+    apply_logits_mask,
+    apply_logits_mask_batched,
+)
 
-# PhonoP2CPreModel
+
+def _to_njt(flat: torch.Tensor, offsets: torch.Tensor, min_seqlen, max_seqlen):
+    if min_seqlen is None or max_seqlen is None:
+        seq_lens = offsets[1:] - offsets[:-1]
+        min_seqlen = seq_lens.min()
+        max_seqlen = seq_lens.max()
+    return torch.nested.nested_tensor_from_jagged(
+        flat, offsets, min_seqlen=min_seqlen, max_seqlen=max_seqlen
+    )
+
+
+def _layer_checkpoint(fn, *args):
+    """Checkpointed layer block (non-reentrant).
+
+    ``determinism_check="none"`` is required: the default metadata extractor
+    reads ``tensor.shape`` on saved tensors, which nested jagged tensors do
+    not support.  The layers contain no dropout / RNG, so the determinism
+    check is not needed.
+    """
+    return torch.utils.checkpoint.checkpoint(
+        fn, *args, use_reentrant=False, determinism_check="none"
+    )
+
+
+# PhonoP2CPreModel (causal decoder)
 class PhonoP2CPreModel(PreTrainedModel):
     config_class = PreModelConfig
     base_model_prefix = "phono_p2c_pre"
-    supports_gradient_checkpointing = False
-    _no_split_modules = ["MHSALayer"]
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["MHSALayer", "MHCALayer"]
 
     def __init__(self, config: PreModelConfig):
         super().__init__(config)
@@ -35,94 +88,243 @@ class PhonoP2CPreModel(PreTrainedModel):
         self.embed = nn.Embedding(config.vocab_size, dim)
         self.num_layers = config.mhsa_layers
         self.max_seqlen = config.max_seqlen
+        self.post_max_seqlen = config.post_max_seqlen
+        self.gradient_checkpointing = False
 
         self.layers = nn.ModuleList([])
         for _ in range(config.mhsa_layers):
             self.layers.append(
                 nn.ModuleDict({
                     "mhsa": MHSALayer(dim, config.attn_dim, config.mhsa_heads, config.rope_theta, config.max_seqlen),
+                    "mhca": MHCALayer(dim, config.mhca_attn_dim, config.mhca_heads, config.rope_theta),
                     "ffn": SwiGLU(dim, config.ffn_common_dim, dim),
                     "norm1": nn.RMSNorm(dim),
                     "norm2": nn.RMSNorm(dim),
+                    "norm3": nn.RMSNorm(dim),
                 })
             )
         self.final_norm = nn.RMSNorm(dim)
-
-        self.cross_attn_heads = config.cross_attn_heads
-        self.mhca_attn_dim = config.mhca_attn_dim
-        self.kv_proj = nn.Linear(dim, config.mhca_attn_dim * 2, bias=False)
+        self.lm_proj = nn.Linear(dim, config.proj_size, bias=False)
 
         self.post_init()
 
-    def forward(self, input_ids, offsets=None, kv_cache_memory=None, current_seqlen=None,
-                min_seqlen=None, max_seqlen=None,
-                pre_cross_kv_cache=None, pre_cross_cache_pos=None):
+    def _checkpoint_pass1_layer(self, layer, hidden, offsets, position_ids, min_seqlen, max_seqlen):
+        """Unconditional decoder layer block (pass 1), checkpointable.
+
+        Mirror of the pass-1 loop body: norm1 -> self-attn -> norm3 -> ffn.
+        """
+        residual = hidden
+        hidden = layer["norm1"](hidden)
+        hidden, kv = layer["mhsa"](
+            hidden, offsets=offsets, is_causal=True,
+            position_ids=position_ids, return_kv=True,
+            min_seqlen=min_seqlen, max_seqlen=max_seqlen,
+        )
+        hidden = hidden + residual
+
+        residual = hidden
+        hidden = layer["norm3"](hidden)
+        hidden = layer["ffn"](hidden)
+        hidden = hidden + residual
+        return hidden, kv
+
+    def _checkpoint_pass2_layer(self, layer, hidden, offsets, position_ids, past_kv,
+                                layer_idx, post_hidden, post_offsets,
+                                q_pos_ids, kv_pos_ids,
+                                min_seqlen, max_seqlen, min_seqlen_post, max_seqlen_post):
+        """Conditional (cross-attended) decoder layer block (pass 2), checkpointable."""
+        residual = hidden
+        hidden = layer["norm1"](hidden)
+        hidden, _ = layer["mhsa"](
+            hidden, offsets=offsets, is_causal=True,
+            position_ids=position_ids, past_kv=past_kv, layer_idx=layer_idx,
+            min_seqlen=min_seqlen, max_seqlen=max_seqlen,
+        )
+        hidden = hidden + residual
+
+        residual = hidden
+        hidden = layer["norm2"](hidden)
+        hidden = layer["mhca"](
+            hidden, enc_hidden=post_hidden,
+            offsets=offsets, post_offsets=post_offsets,
+            q_position_ids=q_pos_ids, kv_position_ids=kv_pos_ids,
+            min_seqlen_q=min_seqlen, max_seqlen_q=max_seqlen,
+            min_seqlen_kv=min_seqlen_post, max_seqlen_kv=max_seqlen_post,
+        )
+        hidden = hidden + residual
+
+        residual = hidden
+        hidden = layer["norm3"](hidden)
+        hidden = layer["ffn"](hidden)
+        hidden = hidden + residual
+        return hidden
+
+    def forward(self, input_ids, offsets=None, min_seqlen=None, max_seqlen=None,
+                kv_cache_memory=None, current_seqlen=None,
+                past_kv=None,
+                post_hidden=None, post_offsets=None,
+                min_seqlen_post=None, max_seqlen_post=None,
+                post_position_offset=None,
+                logits_mask=None,
+                use_custom_ops=False):
+        """Decoder forward.
+
+        NJT path (``offsets`` given):
+            * pass 1 (``post_hidden=None``): returns ``(logits_njt, past_kv)``
+              where ``past_kv`` is a single nested jagged tensor of shape
+              ``[B, j1, L, 2, H, D]`` (layer axis + K/V axis) holding the
+              per-layer pre-RoPE K and V.
+            * pass 2 (``post_hidden``, ``past_kv`` and ``post_offsets`` given):
+              returns ``(logits_njt, None)``; ``logits_mask`` (flat
+              [total_post, chinese_vocab] bool) is applied to the target
+              logits positions when provided.
+
+        Batched path (``offsets=None``):
+            * with ``kv_cache_memory`` + ``current_seqlen``: the self-attn KV
+              cache is updated in place; returns ``(logits, cache)``.
+            * without cache: plain batched forward.
+            * pass 2 additionally takes ``post_hidden`` ([B, T, dim]),
+              ``post_position_offset`` (full decoder length; the encoder
+              positions start there) and an optional ``logits_mask``.
+
+        ``use_custom_ops`` routes the in-place KV-cache update through the
+        ``phono::update_mhsa_kv`` torch.library op (ExecuTorch export only);
+        the default (False) uses standard PyTorch ops that run on any device.
+        """
+        using_cross = post_hidden is not None
         using_cache = kv_cache_memory is not None and current_seqlen is not None
 
+        if using_cross and post_position_offset is None and offsets is None:
+            raise ValueError("Batched pass 2 requires post_position_offset (full decoder length).")
+
         if offsets is not None:
+            # --------------------------- NJT path ---------------------------
             flat_ids = input_ids
             hidden = self.embed(flat_ids)
             position_ids = make_local_position_ids(offsets)
+
+            if using_cross:
+                if past_kv is None:
+                    raise ValueError("NJT pass 2 requires past_kv (first-pass self-attn KV).")
+                q_pos_ids, kv_pos_ids = MHCALayer.compute_position_ids(offsets, post_offsets)
+
+            past_k_list = []
+            past_v_list = []
+            for layer_idx, layer in enumerate(self.layers):
+                if using_cross:
+                    if self.gradient_checkpointing:
+                        hidden = _layer_checkpoint(
+                            self._checkpoint_pass2_layer, layer, hidden,
+                            offsets, position_ids, past_kv, layer_idx,
+                            post_hidden, post_offsets, q_pos_ids, kv_pos_ids,
+                            min_seqlen, max_seqlen, min_seqlen_post, max_seqlen_post,
+                        )
+                    else:
+                        hidden = self._checkpoint_pass2_layer(
+                            layer, hidden, offsets, position_ids, past_kv, layer_idx,
+                            post_hidden, post_offsets, q_pos_ids, kv_pos_ids,
+                            min_seqlen, max_seqlen, min_seqlen_post, max_seqlen_post,
+                        )
+                else:
+                    if self.gradient_checkpointing:
+                        hidden, kv = _layer_checkpoint(
+                            self._checkpoint_pass1_layer, layer, hidden,
+                            offsets, position_ids, min_seqlen, max_seqlen,
+                        )
+                    else:
+                        hidden, kv = self._checkpoint_pass1_layer(
+                            layer, hidden, offsets, position_ids, min_seqlen, max_seqlen
+                        )
+                    past_k_list.append(kv[0])
+                    past_v_list.append(kv[1])
+
+            hidden = self.final_norm(hidden)
+            flat_logits = self.lm_proj(hidden)
+
+            if using_cross and logits_mask is not None:
+                flat_logits = apply_logits_mask(flat_logits, offsets, post_offsets, logits_mask)
+
+            logits_njt = _to_njt(flat_logits, offsets, min_seqlen, max_seqlen)
+            if using_cross:
+                return logits_njt, None
+
+            # Pack the per-layer K/V into a single nested jagged tensor with a
+            # layer axis: [B, j1, L, 2, H, D].  A single tensor argument avoids
+            # graph breaks when it crosses the two decoder passes under compile.
+            kv_all = torch.stack(
+                [torch.stack([k, v], dim=1) for k, v in zip(past_k_list, past_v_list)],
+                dim=1,
+            )  # [total_tokens, L, 2, H, D]
+            past_kv = torch.nested.nested_tensor_from_jagged(
+                kv_all, offsets, min_seqlen=min_seqlen, max_seqlen=max_seqlen,
+            )
+            return logits_njt, past_kv
+
         else:
+            # -------------------------- Batched path ------------------------
             hidden = self.embed(input_ids)
-            position_ids = None
+            B, S = hidden.shape[:2]
 
-        for layer_idx, layer in enumerate(self.layers):
-            residual = hidden
-            hidden = layer["norm1"](hidden)
+            q_pos_start = current_seqlen[0].item() if using_cache else 0
+            kv_pos_offset = post_position_offset if using_cross else None
 
-            if offsets is not None:
-                hidden = layer["mhsa"](
-                    hidden, offsets=offsets, is_causal=True, position_ids=position_ids,
-                    min_seqlen=min_seqlen, max_seqlen=max_seqlen,
+            plain_past_kv = []
+            for layer_idx, layer in enumerate(self.layers):
+                residual = hidden
+                hidden = layer["norm1"](hidden)
+                if using_cache:
+                    hidden, kv_cache_memory = layer["mhsa"](
+                        hidden, is_causal=True,
+                        kv_cache_full=kv_cache_memory,
+                        cache_pos=current_seqlen,
+                        layer_idx=layer_idx,
+                        use_custom_ops=use_custom_ops,
+                    )
+                else:
+                    hidden, kv = layer["mhsa"](
+                        hidden, is_causal=True, return_kv=not using_cross,
+                    )
+                    if not using_cross:
+                        plain_past_kv.append(kv)
+                hidden = hidden + residual
+
+                if using_cross:
+                    residual = hidden
+                    hidden = layer["norm2"](hidden)
+                    hidden = layer["mhca"](
+                        hidden, enc_hidden=post_hidden,
+                        q_pos_start=q_pos_start,
+                        kv_pos_offset=kv_pos_offset,
+                    )
+                    hidden = hidden + residual
+
+                residual = hidden
+                hidden = layer["norm3"](hidden)
+                hidden = layer["ffn"](hidden)
+                hidden = hidden + residual
+
+            hidden = self.final_norm(hidden)
+            logits = self.lm_proj(hidden)
+
+            if using_cross and logits_mask is not None:
+                logits = apply_logits_mask_batched(
+                    logits, current_seqlen if using_cache else torch.zeros(1, dtype=torch.long, device=logits.device),
+                    post_position_offset, logits_mask,
                 )
-            elif using_cache:
-                hidden = layer["mhsa"](
-                    hidden, is_causal=True,
-                    kv_cache_full=kv_cache_memory,
-                    cache_pos=current_seqlen,
-                    layer_idx=layer_idx,
-                )
-            else:
-                hidden = layer["mhsa"](hidden, is_causal=True)
 
-            hidden = hidden + residual
-
-            residual = hidden
-            hidden = layer["norm2"](hidden)
-            hidden = layer["ffn"](hidden)
-            hidden = hidden + residual
-
-        hidden = self.final_norm(hidden)
-
-        pre_K, pre_V = self.kv_proj(hidden).chunk(2, dim=-1)
-        head_dim = self.mhca_attn_dim // self.cross_attn_heads
-
-        if offsets is not None:
-            total_tokens = hidden.shape[0]
-            pre_K = pre_K.view(total_tokens, self.cross_attn_heads, head_dim)
-            pre_V = pre_V.view(total_tokens, self.cross_attn_heads, head_dim)
-        else:
-            S = hidden.shape[1]
-            pre_K = pre_K.view(hidden.shape[0], S, self.cross_attn_heads, head_dim)
-            pre_V = pre_V.view(hidden.shape[0], S, self.cross_attn_heads, head_dim)
-
-            if pre_cross_kv_cache is not None and pre_cross_cache_pos is not None:
-                pos = pre_cross_cache_pos[0].item()
-                torch._check(pos >= 0)
-                torch._check(pos + S <= self.max_seqlen)
-                updated = update_cross_kv(pre_cross_kv_cache, pre_K, pre_V, pos)
-                return updated
-
-        return hidden, pre_K, pre_V
+            if using_cache:
+                return logits, kv_cache_memory
+            if not using_cross:
+                return logits, plain_past_kv
+            return logits, None
 
 
-# PhonoP2CPostModel
+# PhonoP2CPostModel (bidirectional pinyin encoder)
 class PhonoP2CPostModel(PreTrainedModel):
     config_class = PostModelConfig
     base_model_prefix = "phono_p2c_post"
-    supports_gradient_checkpointing = False
-    _no_split_modules = ["MHSALayer", "MHCALayer", "MoE_EC_FFN"]
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["MHSALayer", "MoE_EC_FFN"]
 
     def __init__(self, config: PostModelConfig):
         super().__init__(config)
@@ -130,17 +332,15 @@ class PhonoP2CPostModel(PreTrainedModel):
 
         self.embed = nn.Embedding(config.vocab_size, dim)
         self.use_moe = config.use_moe_ffn
-        self.pre_max_seqlen = config.pre_max_seqlen
         self.max_seqlen = config.max_seqlen
+        self.gradient_checkpointing = False
 
         self.layers = nn.ModuleList([])
         for _ in range(config.mhsa_layers):
             layer_mods = {
                 "mhsa": MHSALayer(dim, config.attn_dim, config.mhsa_heads, config.rope_theta, config.max_seqlen),
-                "mhca": MHCALayer(dim, config.mhca_attn_dim, config.mhca_heads, config.rope_theta, config.pre_max_seqlen),
                 "norm1": nn.RMSNorm(dim),
                 "norm2": nn.RMSNorm(dim),
-                "norm3": nn.RMSNorm(dim),
             }
             if config.use_moe_ffn:
                 layer_mods["ffn"] = MoE_EC_FFN(
@@ -152,96 +352,75 @@ class PhonoP2CPostModel(PreTrainedModel):
             self.layers.append(nn.ModuleDict(layer_mods))
 
         self.final_norm = nn.RMSNorm(dim)
-        self.lm_head = nn.Linear(dim, config.proj_size, bias=False)
-        
-        self.register_buffer("logits_mask", torch.ones((config.vocab_size, config.proj_size), dtype=torch.bool))
+
+        # pinyin -> possible chinese chars possibility map.  Replaced by the
+        # trainer with the tokenizer-built mask.
+        self.register_buffer(
+            "logits_mask", torch.ones((config.vocab_size, config.proj_size), dtype=torch.bool)
+        )
 
         self.post_init()
 
-    def forward(self, input_ids, input_offsets=None, pre_K=None, pre_V=None,
-                pre_offsets=None, pre_cross_kv_cache=None, current_seqlen=None,
-                min_seqlen=None, max_seqlen=None,
-                min_seqlen_pre=None, max_seqlen_pre=None,
-                return_last_hidden=False):
-        using_cache = pre_cross_kv_cache is not None and current_seqlen is not None
+    def _checkpoint_encoder_layer(self, layer, hidden, input_offsets, position_ids, min_seqlen, max_seqlen):
+        """Bidirectional encoder layer block (NJT path), checkpointable."""
+        residual = hidden
+        hidden = layer["norm1"](hidden)
+        hidden, _ = layer["mhsa"](
+            hidden, offsets=input_offsets, is_causal=False,
+            position_ids=position_ids,
+            min_seqlen=min_seqlen, max_seqlen=max_seqlen,
+        )
+        hidden = hidden + residual
 
+        residual = hidden
+        hidden = layer["norm2"](hidden)
+        if self.use_moe:
+            hidden = layer["ffn"](hidden, offsets=input_offsets)
+        else:
+            hidden = layer["ffn"](hidden)
+        hidden = hidden + residual
+        return hidden
+
+    def forward(self, input_ids, input_offsets=None, min_seqlen=None, max_seqlen=None):
+        """Encode a pinyin sequence; return hidden states and the logits mask.
+
+        NJT path: returns (hidden [total_tokens, model_dim], mask [total_tokens, proj_size]).
+        Batched path: returns (hidden [B, S, model_dim], mask [B, S, proj_size]).
+        """
         if input_offsets is not None:
             flat_ids = input_ids
             hidden = self.embed(flat_ids)
+            position_ids = make_local_position_ids(input_offsets)
 
-            self_position_ids = make_local_position_ids(input_offsets)
-            cross_q_position_ids, cross_kv_position_ids = MHCALayer.compute_position_ids(
-                input_offsets, pre_offsets
-            )
+            for layer in self.layers:
+                if self.gradient_checkpointing:
+                    hidden = _layer_checkpoint(
+                        self._checkpoint_encoder_layer, layer, hidden,
+                        input_offsets, position_ids, min_seqlen, max_seqlen,
+                    )
+                else:
+                    hidden = self._checkpoint_encoder_layer(
+                        layer, hidden, input_offsets, position_ids, min_seqlen, max_seqlen
+                    )
+
+            hidden = self.final_norm(hidden)
+            mask = self.logits_mask[flat_ids]
+            return hidden, mask
+
         else:
             hidden = self.embed(input_ids)
-            self_position_ids = None
-            cross_q_position_ids = None
-            cross_kv_position_ids = None
 
-        for layer_idx, layer in enumerate(self.layers):
-            # Bidirectional self-attention
-            residual = hidden
-            hidden = layer["norm1"](hidden)
-            hidden = layer["mhsa"](
-                hidden, offsets=input_offsets, is_causal=False, position_ids=self_position_ids,
-                min_seqlen=min_seqlen, max_seqlen=max_seqlen,
-            )
-            hidden = hidden + residual
+            for layer in self.layers:
+                residual = hidden
+                hidden = layer["norm1"](hidden)
+                hidden, _ = layer["mhsa"](hidden, is_causal=False)
+                hidden = hidden + residual
 
-            # Cross-attention shared KV across all layers
-            residual = hidden
-            hidden = layer["norm2"](hidden)
-            hidden = layer["mhca"](
-                hidden, pre_K=pre_K, pre_V=pre_V,
-                offsets=input_offsets,
-                pre_offsets=pre_offsets,
-                pre_kv_cache=(
-                    (pre_cross_kv_cache[0], pre_cross_kv_cache[1])
-                    if using_cache else None
-                ),
-                cache_pos=current_seqlen if using_cache else None,
-                q_position_ids=cross_q_position_ids,
-                kv_position_ids=cross_kv_position_ids,
-                min_seqlen_q=min_seqlen, max_seqlen_q=max_seqlen,
-                min_seqlen_kv=min_seqlen_pre, max_seqlen_kv=max_seqlen_pre,
-            )
-            hidden = hidden + residual
-
-            # FFN
-            residual = hidden
-            hidden = layer["norm3"](hidden)
-            if self.use_moe:
-                hidden = layer["ffn"](hidden, offsets=input_offsets)
-            else:
+                residual = hidden
+                hidden = layer["norm2"](hidden)
                 hidden = layer["ffn"](hidden)
-            hidden = hidden + residual
+                hidden = hidden + residual
 
-        hidden = self.final_norm(hidden)
-
-        if input_offsets is not None:
-            flat_logits = self.lm_head(hidden)
-
-            per_pos_mask = self.logits_mask[flat_ids]
-            flat_logits = flat_logits.masked_fill(~per_pos_mask, float('-inf'))
-
-            if min_seqlen is None or max_seqlen is None:
-                seq_lens = input_offsets[1:] - input_offsets[:-1]
-                min_seqlen = seq_lens.min()
-                max_seqlen = seq_lens.max()
-            logits_njt = torch.nested.nested_tensor_from_jagged(
-                flat_logits, input_offsets,
-                min_seqlen=min_seqlen, max_seqlen=max_seqlen,
-            )
-            if return_last_hidden:
-                return logits_njt, hidden
-            return logits_njt
-        else:
-            logits = self.lm_head(hidden)
-
-            per_pos_mask = self.logits_mask[input_ids]
-            logits = logits.masked_fill(~per_pos_mask, float('-inf'))
-
-            if return_last_hidden:
-                return logits, hidden
-            return logits
+            hidden = self.final_norm(hidden)
+            mask = self.logits_mask[input_ids]
+            return hidden, mask

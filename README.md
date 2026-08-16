@@ -1,25 +1,27 @@
 # PhonoP2C
 
-PhonoP2C（Fast Pinyin-to-Chinese）是一个拼音转汉字的端到端研究项目：输入"中文上下文 + 拼音音节"，输出汉字。模型采用两段式 PostfixLM 架构，由前段因果编码器处理上下文、后段双向解码器读取拼音并预测汉字，候选汉字以拼音可能性掩码限定，并可用词典约束的 Viterbi 解码精化；两个子模型联合端到端训练。
+PhonoP2C（Fast Pinyin-to-Chinese）是一个拼音转汉字的端到端研究项目：输入"中文上下文 + 拼音音节"，输出汉字。新标准架构采用编码器-解码器设计——**pre 模型是因果解码器**（读取中文序列，交叉注意力参考拼音编码器的隐状态，`lm_proj` 输出 `chinese_vocab` logits），**post 模型是双向编码器**（读取拼音序列，输出隐状态与 logits 掩码，不输出 logits）；编码器序列位置 id 位于解码器之后（RoPE）。训练时使用两遍前向（无条件 + 条件），两个 loss（unconditional_loss / conditional_loss）分别记录。
 
-PhonoP2C (Fast Pinyin-to-Chinese) is an end-to-end research project on pinyin-to-Chinese conversion: "Chinese context + pinyin syllables" in, Chinese characters out. It uses a two-stage PostfixLM architecture — a causal pre-model encodes the context, a bidirectional post-model reads pinyin and predicts characters, restricted by a pinyin possibility mask and optionally refined with dictionary-constrained Viterbi decoding. Both sub-models are trained jointly end-to-end.
+PhonoP2C (Fast Pinyin-to-Chinese) is an end-to-end research project on pinyin-to-Chinese conversion: "Chinese context + pinyin syllables" in, Chinese characters out. The new-standard architecture is encoder-decoder — the **pre model is a causal decoder** (reads the Chinese sequence, cross-attends over the pinyin encoder's hidden states, and outputs `chinese_vocab` logits via `lm_proj`), while the **post model is a bidirectional encoder** (reads the pinyin sequence and outputs hidden states plus a logits mask; no logits). Encoder sequence position ids are placed after the decoder (RoPE). Training uses a two-pass forward (unconditional + conditional) whose losses are logged separately.
 
 ## 项目结构
 
-- `main.py` / `tasks/` — hydra 入口与训练、解码校准任务
-- `preprocessor.py` / `subset.py` / `tokenizer.py` / `dataset.py` — 语料预处理、分词与数据层
-- `model/` — PreModel / PostModel、注意力、SwiGLU、MoE、RoPE、KV Cache 自定义算子
-- `loss.py` / `metrics/` / `utils/` — 损失、评估指标与 float8 工具
+- `main.py` / `tasks/` — hydra 入口与训练、预处理、解码校准任务
+- `datasets_pipeline/` — 数据层（`dataset.py`、`preprocessor.py`）与共享组件（`constants.py`、`pinyin.py`、`segments.py`）
+- `subset.py` / `tokenizer.py` — 语料子集抽取与三词表 tokenizer（含 `sample_heteronym` 异读采样）
+- `model/` — 解码器 / 编码器、注意力、SwiGLU、MoE、RoPE、KV Cache 自定义算子、`beam_search.py`
+- `loss.py` / `metrics/` / `utils/` — 损失、评估指标（含 beam search Top-K 句准确率）与 float8 工具
 - `algo/` — Trie 词典匹配与 Viterbi N-best 解码
 - `export.py` / `demo.py` — ExecuTorch 导出与推理演示
 - `config/` / `vocabs/` / `dicts/` / `datasets/` / `checkpoints/` — 配置、词表、词典、数据与产出
 
 ## Project Layout
 
-- `main.py` / `tasks/` — hydra entry point and train / decoding-calibration tasks
-- `preprocessor.py` / `subset.py` / `tokenizer.py` / `dataset.py` — corpus preprocessing, tokenization, data layer
-- `model/` — PreModel / PostModel, attention, SwiGLU, MoE, RoPE, custom KV-cache ops
-- `loss.py` / `metrics/` / `utils/` — losses, evaluation metrics, float8 utilities
+- `main.py` / `tasks/` — hydra entry point and train / preprocess / decoding-calibration tasks
+- `datasets_pipeline/` — data layer (`dataset.py`, `preprocessor.py`) and shared components (`constants.py`, `pinyin.py`, `segments.py`)
+- `subset.py` / `tokenizer.py` — corpus subsetting and the three-vocabulary tokenizer (incl. `sample_heteronym`)
+- `model/` — decoder / encoder, attention, SwiGLU, MoE, RoPE, custom KV-cache ops, `beam_search.py`
+- `loss.py` / `metrics/` / `utils/` — losses, metrics (incl. beam-search Top-K sentence accuracy), float8 utilities
 - `algo/` — trie dictionary matching and Viterbi N-best decoding
 - `export.py` / `demo.py` — ExecuTorch export and inference demo
 - `config/` / `vocabs/` / `dicts/` / `datasets/` / `checkpoints/` — configs, vocabularies, dictionaries, data, outputs
@@ -27,20 +29,20 @@ PhonoP2C (Fast Pinyin-to-Chinese) is an end-to-end research project on pinyin-to
 ## 工作流
 
 1. 语料放入 `datasets/pretrain_base`，可选先用 `subset.py` 抽取子集。
-2. `preprocessor.py` 将语料规范化为 MDS / Arrow 数据集（`datasets/pretrain_v1`）。
-3. `main.py` 联合训练两个子模型，产出 `checkpoints/`。
+2. `python main.py task=preprocess`（或 `python -m datasets_pipeline.preprocessor --preprocess`）将语料规范化为 MDS / Arrow 数据集（`datasets/pretrain_v2`），并统计字-音频率写入 `vocabs/characters_pronounce_frequency.json`。
+3. `main.py` 联合训练两个子模型（两遍前向），产出 `checkpoints/`（pre / post 分别保存）。
 4. `main.py task=param_search` 用 Optuna 搜索 Viterbi 解码先验。
-5. `export.py` 导出 ExecuTorch .pte 文件。
-6. `demo.py` 演示 greedy / top-k / Viterbi 解码。
+5. `export.py` 导出 ExecuTorch .pte 文件（pre pass1 / pre pass2 / post）。
+6. `demo.py` 演示 greedy / beam / Viterbi 解码。
 
 ## Workflow
 
 1. Put raw corpora in `datasets/pretrain_base`; optionally extract a subset with `subset.py` first.
-2. `preprocessor.py` normalizes corpora into MDS / Arrow datasets (`datasets/pretrain_v1`).
-3. `main.py` jointly trains both sub-models, producing `checkpoints/`.
+2. `python main.py task=preprocess` (or `python -m datasets_pipeline.preprocessor --preprocess`) normalizes corpora into MDS / Arrow datasets (`datasets/pretrain_v2`) and writes per-character pronunciation frequencies to `vocabs/characters_pronounce_frequency.json`.
+3. `main.py` jointly trains both sub-models (two-pass forward), producing `checkpoints/` (pre / post saved individually).
 4. `main.py task=param_search` tunes Viterbi decoding priors with Optuna.
-5. `export.py` exports ExecuTorch `.pte` files.
-6. `demo.py` demonstrates greedy / top-k / Viterbi decoding.
+5. `export.py` exports ExecuTorch `.pte` files (pre pass1 / pre pass2 / post).
+6. `demo.py` demonstrates greedy / beam / Viterbi decoding.
 
 ## 运行环境
 
@@ -48,9 +50,9 @@ PhonoP2C (Fast Pinyin-to-Chinese) is an end-to-end research project on pinyin-to
 
 - `pixi install` / `pixi run python ...` 运行任意脚本。
 - `python subset.py` — 构建语料子集。
-- `python preprocessor.py --preprocess` — 完整预处理。
-- `python preprocessor.py --generate_val` — 物化验证集。
+- `python main.py task=preprocess` — 完整预处理（配置见 `config/dataset/pretrain_v2.yaml`）。
 - `python main.py` — 训练（可通过 hydra 覆盖配置，例如 `task=param_search`）。
+- `python -m pytest tests` — 运行测试。
 - `python export.py` — ExecuTorch 导出。
 - `python demo.py` — 推理演示。
 
@@ -64,9 +66,9 @@ The project uses pixi (`pixi.toml`): Python 3.13, CUDA 13 runtime, PyTorch cu130
 
 - `pixi install` / `pixi run python ...` to run any script.
 - `python subset.py` — build a corpus subset.
-- `python preprocessor.py --preprocess` — full preprocessing.
-- `python preprocessor.py --generate_val` — materialize the val dataset.
+- `python main.py task=preprocess` — full preprocessing (config in `config/dataset/pretrain_v2.yaml`).
 - `python main.py` — train (config overridable via hydra, e.g. `task=param_search`).
+- `python -m pytest tests` — run the test suite.
 - `python export.py` — ExecuTorch export.
 - `python demo.py` — inference demo.
 
@@ -78,7 +80,7 @@ The project uses pixi (`pixi.toml`): Python 3.13, CUDA 13 runtime, PyTorch cu130
 
 项目文档按预处理、训练、导出与推理三个部门组织，每份文档按部门层和函数层描述组件，详细用法请阅读对应文档：
 
-- [预处理部门（preprocess.md）](docs/zh-cn/preprocess.md) — `subset.py`、`preprocessor.py`、`tokenizer.py`、数据层
+- [预处理部门（preprocess.md）](docs/zh-cn/preprocess.md) — `subset.py`、`datasets_pipeline/preprocessor.py`、`tokenizer.py`、数据层
 - [训练部门（train.md）](docs/zh-cn/train.md) — 模型架构、`main.py`、hydra 配置、Trainer、损失与指标
 - [导出与推理部门（export.md）](docs/zh-cn/export.md) — 解码校准、ExecuTorch 导出、推理演示
 
@@ -88,7 +90,7 @@ The project uses pixi (`pixi.toml`): Python 3.13, CUDA 13 runtime, PyTorch cu130
 
 The project documentation is organized into three departments — preprocess, train, export & inference — each describing components at department and function levels. For details, see:
 
-- [Preprocess department (preprocess.md)](docs/en-us/preprocess.md) — `subset.py`, `preprocessor.py`, `tokenizer.py`, data layer
+- [Preprocess department (preprocess.md)](docs/en-us/preprocess.md) — `subset.py`, `datasets_pipeline/preprocessor.py`, `tokenizer.py`, data layer
 - [Train department (train.md)](docs/en-us/train.md) — model architecture, `main.py`, hydra configs, Trainer, losses and metrics
 - [Export & Inference department (export.md)](docs/en-us/export.md) — decoding calibration, ExecuTorch export, inference demo
 

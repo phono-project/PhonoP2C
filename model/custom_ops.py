@@ -131,3 +131,21 @@ def update_mhsa_kv(cache, k_val, v_val, start_pos, layer_idx):
     if isinstance(start_pos, torch.Tensor):
         start_pos = start_pos.item()
     return torch.ops.phono.update_mhsa_kv(cache, k_val, v_val, start_pos, layer_idx)
+
+
+def update_mhsa_kv_standard(cache, k_val, v_val, start_pos, layer_idx):
+    """Pure-PyTorch equivalent of ``update_mhsa_kv`` (no custom op).
+
+    The ``phono::update_mhsa_kv`` torch.library op only has a CPU backend and
+    is intended for ExecuTorch export.  During eager eval/inference (e.g. beam
+    search on CUDA) we route to this standard implementation instead, which
+    works on any device and stays differentiable.
+    """
+    if isinstance(start_pos, torch.Tensor):
+        start_pos = start_pos.item()
+    seq_len = k_val.shape[1]
+    indices = torch.arange(seq_len, device=cache.device) + start_pos
+    res = cache.clone()
+    res[layer_idx, 0].index_copy_(1, indices, k_val)
+    res[layer_idx, 1].index_copy_(1, indices, v_val)
+    return res

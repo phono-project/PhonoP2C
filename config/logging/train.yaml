@@ -1,9 +1,9 @@
 train:
   log_with_wandb: true
   project_name: "PhonoP2C"
-  run_name: "V1.0-Base"
-  notes: "First Release"
-  checkpoint_dir: "./checkpoints/v1_0-base"
+  run_name: "V2.0-Base-Alpha-02"
+  notes: "V2.0 alpha 02 uses gradient checkpointing."
+  checkpoint_dir: "./checkpoints/v2_0-base-alpha02"
   histogram_interval: 10000
   val_interval: 5000
   save_interval: 1

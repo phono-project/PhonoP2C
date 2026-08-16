@@ -1,0 +1,10 @@
+# Task type is Preprocess.
+task_type: "preprocess"
+
+# Run the preprocessing pipeline (corpus -> train MDS + val Arrow), including
+# the per-character pronunciation frequency statistics.
+preprocess: true
+
+# Materialize the validation set (prefix/suffix/pinyin) from the preprocessed
+# val_original dataset.
+generate_val: true
