@@ -114,7 +114,7 @@ def build_configs_from_dict(d: dict, vocab_sizes: dict) -> tuple[PreModelConfig,
         vocab_size=vocab_sizes["context"],
         proj_size=vocab_sizes["chinese"],
         mhca_heads=post_d.get("mhca_heads", post_d.get("mhsa_heads", 4)),
-        mhca_attn_dim=pre_d.get("mhca_attn_dim", common.get("model_dim", 768)),
+        mhca_attn_dim=post_d.get("mhca_attn_dim", common.get("model_dim", 768)),
         post_max_seqlen=post_d.get("max_seqlen", 32),
     )
     post_cfg = PostModelConfig(

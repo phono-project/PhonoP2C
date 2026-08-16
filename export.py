@@ -157,11 +157,12 @@ exported_post = torch.export.export(
 dummy_post_hidden = torch.zeros(
     (BATCH_SIZE, dummy_post_len, post_cfg.model_dim), device=device, dtype=MODEL_TYPE
 )
+# The logits mask is aligned 1:1 with the current decode chunk.
 dummy_logits_mask = torch.ones(
-    (BATCH_SIZE, dummy_post_len, pre_cfg.proj_size), dtype=torch.bool
+    (BATCH_SIZE, dummy_new_prefix_len, pre_cfg.proj_size), dtype=torch.bool
 )
-# Full decoder length: prefix tokens already cached + this chunk + pinyin len
-dummy_post_position_offset = dummy_current_seqlen + dummy_new_prefix_len + dummy_post_len
+# Target/pinyin position offset = len(prefix_ids) = (prefix_len + 1).
+dummy_post_position_offset = dummy_current_seqlen + 1
 
 pre2_example_kwargs = {
     "input_ids": dummy_pre_input_ids,
@@ -172,13 +173,14 @@ pre2_example_kwargs = {
     "logits_mask": dummy_logits_mask,
     "use_custom_ops": True,
 }
+chunk_len_dim = Dim("chunk_len", min=1, max=pre_cfg.max_seqlen)
 pre2_dynamic_shapes = {
-    "input_ids": {1: Dim("chunk_len", min=1, max=pre_cfg.max_seqlen)},
+    "input_ids": {1: chunk_len_dim},
     "kv_cache_memory": None,
     "current_seqlen": None,
     "post_hidden": {1: Dim("post_len2", min=1, max=post_cfg.max_seqlen)},
     "post_position_offset": None,
-    "logits_mask": None,
+    "logits_mask": {1: chunk_len_dim},
     "use_custom_ops": None,
 }
 exported_pre2 = torch.export.export(

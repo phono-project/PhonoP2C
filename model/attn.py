@@ -1,7 +1,8 @@
 """Attention layers for the encoder-decoder PhonoP2C.
 
 MHSALayer — multi-head self-attention with RoPE.  Supports:
-    * NJT (jagged) path, optionally reading past K/V (second training pass),
+    * NJT (jagged) path: pass 1 (prefix) computes pre-RoPE K/V; pass 2
+      (suffix) runs causal self-attention over ``[prefix K/V, suffix K/V]``,
     * batched path with an in-place-updated full KV cache (inference/export),
     * plain batched path.
 
@@ -17,7 +18,13 @@ import torch.nn.functional as F
 from model.utils import (
     RotaryEmbedding,
     apply_rotary_pos_emb,
+    interleave_prefix_suffix,
+    make_full_offsets,
     make_local_position_ids,
+    make_logical_prefix_positions,
+    make_prefix_suffix_positions,
+    make_suffix_global_positions,
+    offsets_from_lens,
     scaled_dot_product_attention_njt,
 )
 from model.custom_ops import update_mhsa_kv, update_mhsa_kv_standard
@@ -50,23 +57,28 @@ class MHSALayer(nn.Module):
     def forward(self, hidden, offsets=None, is_causal=True, kv_cache_full=None,
                 cache_pos=None, layer_idx=None, position_ids=None, past_kv=None,
                 return_kv=False, min_seqlen=None, max_seqlen=None,
-                use_custom_ops=False):
+                use_custom_ops=False, prefix_lens=None,
+                min_seqlen_full=None, max_seqlen_full=None):
         """Self-attention forward.
 
         Args:
             hidden: [total_tokens, dim] (NJT) or [B, S, dim] (batched).
-            offsets: [B+1] if NJT path, else None.
+            offsets: [B+1] if NJT path, else None (pass-1: prefix offsets,
+                pass-2: suffix offsets).
             is_causal: passed to SDPA.
             kv_cache_full: pre-allocated cache [layers, 2, B, max_seqlen, H, D].
             cache_pos: [B] start position for this chunk (batched cache path).
-            layer_idx: layer index for the cache (batched cache path).
-            position_ids: optional precomputed local position ids (NJT).
-            past_kv: single nested jagged tensor [B, j1, L, 2, H, D] holding
-                the pre-RoPE K/V of every layer (second-pass mode, NJT); the
-                current layer is selected with ``layer_idx``.  When given,
-                K/V are not projected.
-            return_kv: return the pre-RoPE (k, v) of this pass.
-            min_seqlen / max_seqlen: precomputed Python ints (NJT).
+            layer_idx: layer index (batched cache / NJT pass-2).
+            position_ids: precomputed position ids for the query (NJT); pass-2
+                uses the suffix *global* positions.
+            past_kv: single nested jagged tensor [B, j1_physical_prefix, L, 2, H, D]
+                holding the (physically padded) prefix pre-RoPE K/V (NJT pass 2).
+            prefix_lens: [B] logical prefix lengths (0 for empty-prefix samples);
+                used to strip the pad token and offset the suffix positions.
+            return_kv: return the pre-RoPE (k, v) of this pass (NJT pass 1).
+            min_seqlen / max_seqlen: precomputed Python ints (NJT suffix).
+            min_seqlen_full / max_seqlen_full: precomputed Python ints for the
+                combined prefix+suffix sequence (NJT pass 2).
             use_custom_ops: use the ``phono::update_mhsa_kv`` torch.library op
                 for the in-place cache update (ExecuTorch export only).  The
                 default routes to the standard PyTorch implementation, which
@@ -78,23 +90,70 @@ class MHSALayer(nn.Module):
         """
         if offsets is not None:   # (NJT path)
             flat_tokens = hidden
-            if position_ids is None:
-                position_ids = make_local_position_ids(offsets)
-
             total_tokens = flat_tokens.shape[0]
             q = self.q_proj(flat_tokens)
             q = q.view(total_tokens, self.num_heads, self.head_dim)
 
             if past_kv is not None:
-                # past_kv: single nested jagged tensor [B, j1, L, 2, H, D];
-                # extract this layer's pre-RoPE K and V (flat values).
-                kv_values = past_kv.values()  # [total_tokens, L, 2, H, D]
-                k = kv_values[:, layer_idx, 0]
-                v = kv_values[:, layer_idx, 1].contiguous()
-            else:
+                # ---- pass 2: suffix Q over [prefix K/V, suffix K/V] causal ----
+                physical_prefix_offsets = past_kv.offsets()
+                logical_prefix_pos = make_logical_prefix_positions(physical_prefix_offsets, prefix_lens)
+
+                kv_values = past_kv.values()  # [total_physical_prefix, L, 2, H, D]
+                prefix_k = kv_values[logical_prefix_pos, layer_idx, 0]  # [total_logical_prefix, H, D]
+                prefix_v = kv_values[logical_prefix_pos, layer_idx, 1].contiguous()
+
                 k, v = self.kv_proj(flat_tokens).chunk(2, dim=-1)
                 k = k.view(total_tokens, self.num_heads, self.head_dim).contiguous()
                 v = v.view(total_tokens, self.num_heads, self.head_dim).contiguous()
+
+                if position_ids is None:
+                    position_ids = make_suffix_global_positions(prefix_lens, offsets)
+                q, k = self._apply_rope_flat(q, k, position_ids)
+
+                # RoPE the cached prefix K with its local positions.
+                prefix_local = make_local_position_ids(offsets_from_lens(prefix_lens))
+                cos_p, sin_p = self.rotary(prefix_local)
+                prefix_k = apply_rotary_pos_emb(prefix_k.unsqueeze(0), cos_p, sin_p).squeeze(0)
+
+                full_offsets = make_full_offsets(prefix_lens, offsets)
+                prefix_pos, suffix_pos = make_prefix_suffix_positions(prefix_lens, offsets, full_offsets)
+
+                q_full = interleave_prefix_suffix(torch.zeros_like(prefix_k), q, prefix_pos, suffix_pos)
+                k_full = interleave_prefix_suffix(prefix_k, k, prefix_pos, suffix_pos)
+                v_full = interleave_prefix_suffix(prefix_v, v, prefix_pos, suffix_pos)
+
+                if min_seqlen_full is None or max_seqlen_full is None:
+                    full_lens = full_offsets[1:] - full_offsets[:-1]
+                    min_seqlen_full = full_lens.min()
+                    max_seqlen_full = full_lens.max()
+
+                q_nt = torch.nested.nested_tensor_from_jagged(
+                    q_full, full_offsets, min_seqlen=min_seqlen_full, max_seqlen=max_seqlen_full
+                )
+                k_nt = torch.nested.nested_tensor_from_jagged(
+                    k_full, full_offsets, min_seqlen=min_seqlen_full, max_seqlen=max_seqlen_full
+                )
+                v_nt = torch.nested.nested_tensor_from_jagged(
+                    v_full, full_offsets, min_seqlen=min_seqlen_full, max_seqlen=max_seqlen_full
+                )
+                q_nt = q_nt.transpose(1, 2)
+                k_nt = k_nt.transpose(1, 2)
+                v_nt = v_nt.transpose(1, 2)
+
+                out_nt = scaled_dot_product_attention_njt(q_nt, k_nt, v_nt, is_causal=True)
+                out_flat = out_nt.transpose(1, 2).values()  # [total_pre, H, D]
+                suffix_out = out_flat[suffix_pos]           # [total_tokens, H, D]
+                out = self.out_proj(suffix_out.reshape(total_tokens, self.attn_dim))
+                return out, None
+
+            # ---- pass 1 (or encoder bidirectional) ----
+            if position_ids is None:
+                position_ids = make_local_position_ids(offsets)
+
+            k, v = self.kv_proj(flat_tokens).chunk(2, dim=-1)
+            k = k.view(total_tokens, self.num_heads, self.head_dim).contiguous()
+            v = v.view(total_tokens, self.num_heads, self.head_dim).contiguous()
 
             pre_rope_k = k
             q, k = self._apply_rope_flat(q, k, position_ids)
@@ -201,8 +260,9 @@ class MHCALayer(nn.Module):
     projector* (``kv_proj``), which is skipped entirely in the first
     (unconditional) decoder pass.
 
-    RoPE: query positions are the decoder's local positions; key positions are
-    the encoder sequence positions *placed after* the decoder sequence.
+    RoPE: query positions are the decoder's suffix positions (placed after the
+    prefix); key positions are the pinyin positions *aligned* with the target
+    positions (``prefix_len + 1 + local``).
     """
 
     def __init__(self, model_dim: int, mhca_attn_dim: int, num_heads: int, rope_theta: float):
@@ -220,17 +280,18 @@ class MHCALayer(nn.Module):
         self.rotary = RotaryEmbedding(self.head_dim, theta=rope_theta)
 
     @staticmethod
-    def compute_position_ids(pre_offsets: torch.Tensor, post_offsets: torch.Tensor):
+    def compute_position_ids(suffix_offsets, post_offsets, prefix_lens):
         """Position ids for the NJT cross-attention path.
 
-        Query positions = decoder (pre) local positions.
-        Key positions   = encoder (post) sequence placed after the decoder:
-        ``L_b + local_post_pos`` where ``L_b`` is the decoder length per sample.
+        Query positions = decoder suffix positions = ``prefix_len + local``.
+        Key positions = pinyin positions *aligned* with the target positions:
+        ``prefix_len + 1 + local``.
         """
-        q_position_ids = make_local_position_ids(pre_offsets)
-        pre_seq_lens = pre_offsets[1:] - pre_offsets[:-1]
-        post_seq_lens = post_offsets[1:] - post_offsets[:-1]
-        kv_position_ids = make_local_position_ids(post_offsets) + pre_seq_lens.repeat_interleave(post_seq_lens)
+        suffix_lens = suffix_offsets[1:] - suffix_offsets[:-1]
+        post_lens = post_offsets[1:] - post_offsets[:-1]
+
+        q_position_ids = make_local_position_ids(suffix_offsets) + prefix_lens.repeat_interleave(suffix_lens)
+        kv_position_ids = make_local_position_ids(post_offsets) + (prefix_lens + 1).repeat_interleave(post_lens)
         return q_position_ids, kv_position_ids
 
     def forward(self, hidden, enc_hidden=None, offsets=None, post_offsets=None,
@@ -258,9 +319,6 @@ class MHCALayer(nn.Module):
             total_q = flat_q.shape[0]
             q = self.q_proj(flat_q)
             q = q.view(total_q, self.num_heads, self.head_dim)
-
-            if q_position_ids is None or kv_position_ids is None:
-                q_position_ids, kv_position_ids = self.compute_position_ids(offsets, post_offsets)
 
             cos_q, sin_q = self.rotary(q_position_ids)
             q = apply_rotary_pos_emb(q.unsqueeze(0), cos_q, sin_q)

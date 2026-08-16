@@ -1,7 +1,7 @@
 epochs: 10
-batchsize: 1280
+batchsize: 3072
 optimizer: "adamw"    # "adamw" or "ademamix"
-learning_rate: 2e-4
+learning_rate: 4e-4
 weight_decay: 1e-3
 warmup_steps: 10000
 gradient_clip_val: 1.0

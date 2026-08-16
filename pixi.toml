@@ -13,11 +13,11 @@ pip = "*"
 
 [pypi-dependencies]
 jieba = "*"
-torch = { version = "*", index = "https://download.pytorch.org/whl/nightly/cu130" }
-torchvision = { version = "*", index = "https://download.pytorch.org/whl/nightly/cu130" }
-triton = { version = "*", index = "https://download.pytorch.org/whl/nightly/cu130" }
-torchao = { version = "*", index = "https://download.pytorch.org/whl/nightly/cu130" }
-mslk = { version = "*", index = "https://download.pytorch.org/whl/nightly/cu130" }
+torch = { version = "*", index = "https://download.pytorch.org/whl/cu130" }
+torchvision = { version = "*", index = "https://download.pytorch.org/whl/cu130" }
+triton = { version = "*", index = "https://download.pytorch.org/whl/cu130" }
+torchao = { version = "*", index = "https://download.pytorch.org/whl/cu130" }
+mslk = { version = "*", index = "https://download.pytorch.org/whl/cu130" }
 executorch = "*"
 bitsandbytes = "*"
 

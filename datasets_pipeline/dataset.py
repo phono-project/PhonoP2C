@@ -89,12 +89,45 @@ def _select_suffix(text_list, pinyin_list, labels, online_cfg, epoch):
     return sel, end, suffix_text, pinyin_slice
 
 
-# Transform functions
+def _build_two_phase(tokenizer, prefix_text, suffix_text):
+    """Split a decoded sequence into the two training-phase inputs.
+
+    Returns ``(full_prefix_ids, prefix_ids, suffix_ids, uncond_target_ids,
+    prefix_len)``:
+
+    * ``full_prefix_ids``: ``[BOS] + ctx(prefix)`` (used by beam search);
+    * ``prefix_ids``: pass-1 (unconditional) input ``[BOS] + ctx(prefix)[:-1]``
+      (physically padded to length 1 with BOS when the prefix is empty);
+    * ``suffix_ids``: pass-2 (conditional) input ``last_ctx + ctx(suffix)[:-1]``;
+    * ``uncond_target_ids``: chinese-vocab ids of the prefix chars (-100 for
+      non-Chinese), padded to the physical prefix length;
+    * ``prefix_len``: the *logical* prefix length (``len(prefix_text)``).
+    """
+    bos = tokenizer.spec_tokens.bos_token
+    ctx_prefix = tokenizer.encode_context(prefix_text)
+    ctx_suffix = tokenizer.encode_context(suffix_text)
+
+    full_prefix = [bos] + ctx_prefix
+    prefix_ids = full_prefix[:-1]
+    suffix_ids = full_prefix[-1:] + ctx_suffix[:-1]
+
+    uncond_target_ids = tokenizer.encode_chinese_with_ignore(prefix_text)
+    if not prefix_ids:
+        prefix_ids = [bos]
+        uncond_target_ids = [-100]
+
+    return full_prefix, prefix_ids, suffix_ids, uncond_target_ids, len(prefix_text)
+
+
 def transform_pinyin_predict_train(batch, tokenizer: P2CTokenizer, aug_cfg=None,
                                    online_policy=None, epoch=None):
-    pre_ids_list = []
+    full_prefix_list = []
+    prefix_ids_list = []
+    suffix_ids_list = []
+    uncond_target_list = []
     postfix_ids_list = []
     targets_ids_list = []
+    prefix_lengths_list = []
 
     aug_cfg = aug_cfg or {}
     online_cfg = online_policy if isinstance(online_policy, dict) else {}
@@ -121,50 +154,68 @@ def transform_pinyin_predict_train(batch, tokenizer: P2CTokenizer, aug_cfg=None,
         )
         pinyin_segments = augment_pinyin_sequence(pinyin_segments, aug_cfg)
 
-        # Decoder input: [BOS] + context prefix + target (both encoded with the
-        # context vocabulary; targets use the chinese vocab only for labels).
-        pre_ids = [tokenizer.spec_tokens.bos_token] \
-            + tokenizer.encode_context(prefix_text) \
-            + tokenizer.encode_context(suffix_text)
+        full_prefix, prefix_ids, suffix_ids, uncond_target_ids, prefix_len = _build_two_phase(
+            tokenizer, prefix_text, suffix_text
+        )
         postfix_ids = tokenizer.encode_pinyin(pinyin_segments)
         target_ids = tokenizer.encode_chinese(suffix_text)
 
-        pre_ids_list.append(pre_ids)
+        full_prefix_list.append(full_prefix)
+        prefix_ids_list.append(prefix_ids)
+        suffix_ids_list.append(suffix_ids)
+        uncond_target_list.append(uncond_target_ids)
         postfix_ids_list.append(postfix_ids)
         targets_ids_list.append(target_ids)
+        prefix_lengths_list.append(prefix_len)
 
     return {
-        "pre_ids": pre_ids_list,
+        "full_prefix_ids": full_prefix_list,
+        "prefix_ids": prefix_ids_list,
+        "suffix_ids": suffix_ids_list,
+        "uncond_target_ids": uncond_target_list,
         "postfix_ids": postfix_ids_list,
         "target_ids": targets_ids_list,
+        "prefix_lengths": prefix_lengths_list,
     }
 
 
 def transform_pinyin_predict_val(batch, tokenizer: P2CTokenizer, aug_cfg=None):
     """Validation transform — prefix/suffix/pinyin were materialized offline."""
-    pre_ids_list = []
+    full_prefix_list = []
+    prefix_ids_list = []
+    suffix_ids_list = []
+    uncond_target_list = []
     postfix_ids_list = []
     targets_ids_list = []
+    prefix_lengths_list = []
 
     for prefix_text, suffix_text, pinyin_json in zip(
         batch["prefix"], batch["suffix"], batch["pinyin"]
     ):
         pinyin_flat = json.loads(pinyin_json) if isinstance(pinyin_json, str) else pinyin_json
 
-        pre_ids = [tokenizer.spec_tokens.bos_token] \
-            + tokenizer.encode_context(prefix_text) \
-            + tokenizer.encode_context(suffix_text)
+        full_prefix, prefix_ids, suffix_ids, uncond_target_ids, prefix_len = _build_two_phase(
+            tokenizer, prefix_text, suffix_text
+        )
         postfix_ids = tokenizer.encode_pinyin(pinyin_flat)
         target_ids = tokenizer.encode_chinese(suffix_text)
 
-        pre_ids_list.append(pre_ids)
+        full_prefix_list.append(full_prefix)
+        prefix_ids_list.append(prefix_ids)
+        suffix_ids_list.append(suffix_ids)
+        uncond_target_list.append(uncond_target_ids)
         postfix_ids_list.append(postfix_ids)
         targets_ids_list.append(target_ids)
+        prefix_lengths_list.append(prefix_len)
 
     return {
-        "pre_ids": pre_ids_list,
+        "full_prefix_ids": full_prefix_list,
+        "prefix_ids": prefix_ids_list,
+        "suffix_ids": suffix_ids_list,
+        "uncond_target_ids": uncond_target_list,
         "postfix_ids": postfix_ids_list,
         "target_ids": targets_ids_list,
+        "prefix_lengths": prefix_lengths_list,
     }
 
 
@@ -173,23 +224,35 @@ def make_collate_fn():
     """NJT collate for efficient training.
 
     Returns:
-        pre_ids_njt:      nested jagged tensor of decoder input ids
-        postfix_ids_njt:  nested jagged tensor of postfix (pinyin) ids
-        target_ids_njt:   nested jagged tensor of target (Chinese) ids
+        full_prefix_ids_njt:      nested jagged tensor of [BOS] + context
+        prefix_ids_njt:           nested jagged tensor of pass-1 prefix ids
+        suffix_ids_njt:           nested jagged tensor of pass-2 suffix ids
+        uncond_target_ids_njt:    nested jagged tensor of unconditional targets
+        postfix_ids_njt:          nested jagged tensor of postfix (pinyin) ids
+        target_ids_njt:           nested jagged tensor of target (Chinese) ids
+        prefix_lengths:           [B] logical prefix lengths
     """
     def collate_fn(batch):
-        pre_ids_list = [item["pre_ids"] for item in batch]
+        full_prefix_list = [item["full_prefix_ids"] for item in batch]
+        prefix_ids_list = [item["prefix_ids"] for item in batch]
+        suffix_ids_list = [item["suffix_ids"] for item in batch]
+        uncond_target_list = [item["uncond_target_ids"] for item in batch]
         postfix_ids_list = [item["postfix_ids"] for item in batch]
         targets_ids_list = [item["target_ids"] for item in batch]
+        prefix_lengths = torch.tensor([item["prefix_lengths"] for item in batch], dtype=torch.long)
 
         def _to_njt(id_lists):
             tensor_list = [torch.tensor(ids, dtype=torch.long) for ids in id_lists]
             return torch.nested.nested_tensor(tensor_list, layout=torch.jagged)
 
         return {
-            "pre_ids_njt": _to_njt(pre_ids_list),
+            "full_prefix_ids_njt": _to_njt(full_prefix_list),
+            "prefix_ids_njt": _to_njt(prefix_ids_list),
+            "suffix_ids_njt": _to_njt(suffix_ids_list),
+            "uncond_target_ids_njt": _to_njt(uncond_target_list),
             "postfix_ids_njt": _to_njt(postfix_ids_list),
             "target_ids_njt": _to_njt(targets_ids_list),
+            "prefix_lengths": prefix_lengths,
         }
 
     return collate_fn

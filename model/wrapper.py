@@ -16,32 +16,31 @@ from typing import NamedTuple
 import torch
 import torch.nn as nn
 
-from model.utils import gather_target_logits
-
 
 class TrainOutput(NamedTuple):
     """Result of one wrapper forward step.
 
-    ``unconditional_logits`` / ``conditional_logits`` are the target-aligned
-    (flat ``[total_target, chinese_vocab]``) logits, kept for metrics.
+    ``conditional_logits`` are the flat ``[total_suffix, chinese_vocab]``
+    conditional logits, kept for metrics.
     """
 
     loss: torch.Tensor
     unconditional_loss: torch.Tensor
     conditional_loss: torch.Tensor
-    unconditional_logits: torch.Tensor
     conditional_logits: torch.Tensor
 
 
 class PhonoP2CTrainWrapper(nn.Module):
     """Wrap the two-pass forward pass and compute the joint loss internally.
 
-    Pass 1: unconditional decoder logits + cached self-attn K/V.
-    Pass 2: pinyin encoder hidden states + mask, then conditional (cross-
-    attended, masked) decoder logits.  ``loss_fn`` maps ``(logits, targets)``
-    to a scalar; it is applied to both passes and the results are summed.
-    torch.compile is applied to this wrapper; the pre and post models stay
-    individually saveable.
+    Pass 1 (unconditional): prefix input -> unconditional logits + cached
+    self-attn K/V.
+    Pass 2 (conditional): pinyin encoder -> hidden + mask, then the suffix
+    input -> cross-attended, masked conditional logits.
+
+    ``loss_fn`` maps ``(logits, targets)`` to a scalar; it is applied to both
+    passes and the results are summed.  torch.compile is applied to this
+    wrapper; the pre and post models stay individually saveable.
     """
 
     def __init__(self, pre_model, post_model, loss_fn):
@@ -50,36 +49,43 @@ class PhonoP2CTrainWrapper(nn.Module):
         self.post_model = post_model
         self.loss_fn = loss_fn
 
-    def forward(self, flat_pre_ids, pre_offsets, flat_postfix_ids, postfix_offsets,
-                flat_target_ids, min_sl_pre=None, max_sl_pre=None,
-                min_sl_post=None, max_sl_post=None):
-        # Pass 1: unconditional decoder forward.
+    def _loss(self, logits, targets):
+        # Guard the all-ignored case (e.g. a batch of empty prefixes) that
+        # plain CrossEntropyLoss would turn into a NaN mean.
+        if targets.numel() == 0 or bool((targets == -100).all()):
+            return logits.sum() * 0.0
+        return self.loss_fn(logits, targets)
+
+    def forward(self, flat_prefix_ids, prefix_offsets, flat_suffix_ids, suffix_offsets,
+                flat_postfix_ids, flat_uncond_target, flat_target_ids, prefix_lens,
+                min_sl_prefix, max_sl_prefix, min_sl_suffix, max_sl_suffix,
+                min_sl_full, max_sl_full):
+        # Pass 1: unconditional decoder forward over the (padded) prefix.
         logits_uncond, past_kv = self.pre_model(
-            flat_pre_ids, offsets=pre_offsets,
-            min_seqlen=min_sl_pre, max_seqlen=max_sl_pre,
+            flat_prefix_ids, offsets=prefix_offsets,
+            min_seqlen=min_sl_prefix, max_seqlen=max_sl_prefix,
         )
 
         # Encoder: pinyin -> hidden states + logits mask.
         post_hidden, post_mask = self.post_model(
-            flat_postfix_ids, input_offsets=postfix_offsets,
-            min_seqlen=min_sl_post, max_seqlen=max_sl_post,
+            flat_postfix_ids, input_offsets=suffix_offsets,
+            min_seqlen=min_sl_suffix, max_seqlen=max_sl_suffix,
         )
 
         # Pass 2: conditional decoder forward (cross-attention + masked logits).
         logits_cond, _ = self.pre_model(
-            flat_pre_ids, offsets=pre_offsets,
-            min_seqlen=min_sl_pre, max_seqlen=max_sl_pre,
-            past_kv=past_kv,
-            post_hidden=post_hidden, post_offsets=postfix_offsets,
-            min_seqlen_post=min_sl_post, max_seqlen_post=max_sl_post,
-            logits_mask=post_mask,
+            flat_suffix_ids, offsets=suffix_offsets,
+            min_seqlen=min_sl_suffix, max_seqlen=max_sl_suffix,
+            past_kv=past_kv, prefix_lens=prefix_lens,
+            min_seqlen_full=min_sl_full, max_seqlen_full=max_sl_full,
+            post_hidden=post_hidden, logits_mask=post_mask,
         )
 
-        flat_uncond = gather_target_logits(logits_uncond.values(), pre_offsets, postfix_offsets)
-        flat_cond = gather_target_logits(logits_cond.values(), pre_offsets, postfix_offsets)
+        flat_uncond = logits_uncond.values()
+        flat_cond = logits_cond.values()
 
-        loss_uncond = self.loss_fn(flat_uncond, flat_target_ids)
-        loss_cond = self.loss_fn(flat_cond, flat_target_ids)
+        loss_uncond = self._loss(flat_uncond, flat_uncond_target)
+        loss_cond = self._loss(flat_cond, flat_target_ids)
         loss = loss_uncond + loss_cond
 
-        return TrainOutput(loss, loss_uncond, loss_cond, flat_uncond, flat_cond)
+        return TrainOutput(loss, loss_uncond, loss_cond, flat_cond)

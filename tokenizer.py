@@ -296,6 +296,13 @@ class P2CTokenizer:
                 ids.append(tid)
         return ids
 
+    def encode_chinese_with_ignore(self, text: str, ignore_index: int = -100) -> list[int]:
+        """Encode text using chinese_vocab, mapping non-Chinese chars to ``ignore_index``.
+
+        Unlike :meth:`encode_chinese`, the length is preserved.
+        """
+        return [self._chinese_vocab.get(ch, ignore_index) for ch in text]
+
     def encode_pinyin(self, pinyin_list: list[str]) -> list[int]:
         """Encode a list of pinyin syllables using pinyin_vocab.
 

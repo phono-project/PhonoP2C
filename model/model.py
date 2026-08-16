@@ -7,32 +7,28 @@ New-standard encoder-decoder PhonoP2C model.
     │  pinyin encoder      │                             │  Chinese -> logits   │
     └──────────────────────┘                             └──────────────────────┘
 
-The pre model is the *decoder*: it reads the Chinese sequence (context prefix
-+ target, teacher-forced during training), performs causal self-attention and —
-in the second pass — cross-attention over the pinyin encoder's hidden states.
-Its ``lm_proj`` produces logits over the *chinese* vocabulary.
-
-The post model is the *encoder*: it reads the pinyin sequence bidirectionally
-and yields its hidden states plus a per-position logits mask.  It does not
-output logits.  In the cross-attention, encoder position ids are placed after
-the decoder sequence (RoPE).
+The pre model is the *decoder*: a causal LM over the sequence
+``[BOS, prefix..., target...]`` split into two phases.
 
 Two-pass training semantics (NJT path, used in train + validation):
 
-    pass 1 (no post hidden states):  self-attn output goes straight to the
-        FFN (cross-attn layer skipped, cross KV projector unused).  The model
-        returns its logits (unconditional) together with the pre-RoPE
-        self-attn K/V, packed into a single nested jagged tensor with a layer
-        axis ([B, j1, L, 2, H, D]).
-    pass 2 (post hidden states + past self-attn K/V + logits mask provided):
-        each layer runs self-attn (queries recomputed, K/V taken from the
-        first pass), then cross-attention over the encoder hidden states,
-        then the FFN.  Logits are masked with the provided logits mask.
+    pass 1 (unconditional, no post hidden): input = ``full_prefix[:-1]`` (the
+        context minus its last token), predicting the context one token ahead.
+        Returns the unconditional logits together with the pre-RoPE self-attn
+        K/V packed into a single nested jagged tensor with a layer axis
+        ([B, j1, L, 2, H, D]).
+    pass 2 (conditional, post hidden + past K/V + logits mask): input =
+        ``full_prefix[-1:] + target[:-1]`` (the last context token + the first
+        T-1 targets), running causal self-attn over ``[prefix K/V, suffix K/V]``
+        then cross-attention over the pinyin encoder hidden states.  Logits are
+        masked 1:1 with the pinyin-derived mask.
 
-The non-NJT (batched) path mirrors this, except the self-attn KV cache is
-updated in place and ``current_seqlen[B]`` tracks the cache fill level
-(batchsize is usually > 1; the post model's non-NJT path usually runs with
-batchsize 1).
+The pinyin (encoder) RoPE positions are aligned with the target positions:
+target j sits at ``prefix_len + 1 + j``.
+
+The non-NJT (batched) path is the incremental decode/prefill used for
+inference/export: pass 1 prefill updates the self-attn KV cache in place;
+pass 2 decode reads the cache and cross-attends.
 """
 
 import torch
@@ -46,6 +42,7 @@ from model.ffn import SwiGLU
 from model.moe import MoE_EC_FFN
 from model.utils import (
     make_local_position_ids,
+    make_suffix_global_positions,
     apply_logits_mask,
     apply_logits_mask_batched,
 )
@@ -109,10 +106,7 @@ class PhonoP2CPreModel(PreTrainedModel):
         self.post_init()
 
     def _checkpoint_pass1_layer(self, layer, hidden, offsets, position_ids, min_seqlen, max_seqlen):
-        """Unconditional decoder layer block (pass 1), checkpointable.
-
-        Mirror of the pass-1 loop body: norm1 -> self-attn -> norm3 -> ffn.
-        """
+        """Unconditional decoder layer block (pass 1), checkpointable."""
         residual = hidden
         hidden = layer["norm1"](hidden)
         hidden, kv = layer["mhsa"](
@@ -129,16 +123,17 @@ class PhonoP2CPreModel(PreTrainedModel):
         return hidden, kv
 
     def _checkpoint_pass2_layer(self, layer, hidden, offsets, position_ids, past_kv,
-                                layer_idx, post_hidden, post_offsets,
-                                q_pos_ids, kv_pos_ids,
-                                min_seqlen, max_seqlen, min_seqlen_post, max_seqlen_post):
+                                layer_idx, prefix_lens, min_seqlen_full, max_seqlen_full,
+                                post_hidden, q_pos_ids, kv_pos_ids, min_seqlen, max_seqlen):
         """Conditional (cross-attended) decoder layer block (pass 2), checkpointable."""
         residual = hidden
         hidden = layer["norm1"](hidden)
         hidden, _ = layer["mhsa"](
             hidden, offsets=offsets, is_causal=True,
             position_ids=position_ids, past_kv=past_kv, layer_idx=layer_idx,
+            prefix_lens=prefix_lens,
             min_seqlen=min_seqlen, max_seqlen=max_seqlen,
+            min_seqlen_full=min_seqlen_full, max_seqlen_full=max_seqlen_full,
         )
         hidden = hidden + residual
 
@@ -146,10 +141,10 @@ class PhonoP2CPreModel(PreTrainedModel):
         hidden = layer["norm2"](hidden)
         hidden = layer["mhca"](
             hidden, enc_hidden=post_hidden,
-            offsets=offsets, post_offsets=post_offsets,
+            offsets=offsets, post_offsets=offsets,
             q_position_ids=q_pos_ids, kv_position_ids=kv_pos_ids,
             min_seqlen_q=min_seqlen, max_seqlen_q=max_seqlen,
-            min_seqlen_kv=min_seqlen_post, max_seqlen_kv=max_seqlen_post,
+            min_seqlen_kv=min_seqlen, max_seqlen_kv=max_seqlen,
         )
         hidden = hidden + residual
 
@@ -161,31 +156,25 @@ class PhonoP2CPreModel(PreTrainedModel):
 
     def forward(self, input_ids, offsets=None, min_seqlen=None, max_seqlen=None,
                 kv_cache_memory=None, current_seqlen=None,
-                past_kv=None,
-                post_hidden=None, post_offsets=None,
-                min_seqlen_post=None, max_seqlen_post=None,
+                past_kv=None, prefix_lens=None,
+                min_seqlen_full=None, max_seqlen_full=None,
+                post_hidden=None, logits_mask=None,
                 post_position_offset=None,
-                logits_mask=None,
                 use_custom_ops=False):
         """Decoder forward.
 
         NJT path (``offsets`` given):
-            * pass 1 (``post_hidden=None``): returns ``(logits_njt, past_kv)``
-              where ``past_kv`` is a single nested jagged tensor of shape
-              ``[B, j1, L, 2, H, D]`` (layer axis + K/V axis) holding the
-              per-layer pre-RoPE K and V.
-            * pass 2 (``post_hidden``, ``past_kv`` and ``post_offsets`` given):
-              returns ``(logits_njt, None)``; ``logits_mask`` (flat
-              [total_post, chinese_vocab] bool) is applied to the target
-              logits positions when provided.
+            * pass 1 (``post_hidden=None``): ``offsets`` are the (physically
+              padded) prefix offsets; returns ``(logits_njt, past_kv)`` where
+              ``past_kv`` is a nested jagged tensor ``[B, j1, L, 2, H, D]``.
+            * pass 2 (``post_hidden`` + ``past_kv`` + ``prefix_lens`` given):
+              ``offsets`` are the suffix offsets; returns ``(logits_njt, None)``
+              with the logits masked 1:1 by ``logits_mask``.
 
-        Batched path (``offsets=None``):
-            * with ``kv_cache_memory`` + ``current_seqlen``: the self-attn KV
-              cache is updated in place; returns ``(logits, cache)``.
-            * without cache: plain batched forward.
-            * pass 2 additionally takes ``post_hidden`` ([B, T, dim]),
-              ``post_position_offset`` (full decoder length; the encoder
-              positions start there) and an optional ``logits_mask``.
+        Batched path (``offsets=None``): incremental decode/prefill with the
+            self-attn KV cache (``kv_cache_memory`` + ``current_seqlen``);
+            ``post_position_offset`` is the target/pinyin position offset
+            (``len(prefix_ids)`` = ``prefix_len + 1``).
 
         ``use_custom_ops`` routes the in-place KV-cache update through the
         ``phono::update_mhsa_kv`` torch.library op (ExecuTorch export only);
@@ -195,18 +184,22 @@ class PhonoP2CPreModel(PreTrainedModel):
         using_cache = kv_cache_memory is not None and current_seqlen is not None
 
         if using_cross and post_position_offset is None and offsets is None:
-            raise ValueError("Batched pass 2 requires post_position_offset (full decoder length).")
+            raise ValueError("Batched pass 2 requires post_position_offset (target/pinyin offset).")
 
         if offsets is not None:
             # --------------------------- NJT path ---------------------------
             flat_ids = input_ids
             hidden = self.embed(flat_ids)
-            position_ids = make_local_position_ids(offsets)
 
             if using_cross:
                 if past_kv is None:
                     raise ValueError("NJT pass 2 requires past_kv (first-pass self-attn KV).")
-                q_pos_ids, kv_pos_ids = MHCALayer.compute_position_ids(offsets, post_offsets)
+                if prefix_lens is None:
+                    raise ValueError("NJT pass 2 requires prefix_lens (logical prefix lengths).")
+                position_ids = make_suffix_global_positions(prefix_lens, offsets)
+                q_pos_ids, kv_pos_ids = MHCALayer.compute_position_ids(offsets, offsets, prefix_lens)
+            else:
+                position_ids = make_local_position_ids(offsets)
 
             past_k_list = []
             past_v_list = []
@@ -216,14 +209,14 @@ class PhonoP2CPreModel(PreTrainedModel):
                         hidden = _layer_checkpoint(
                             self._checkpoint_pass2_layer, layer, hidden,
                             offsets, position_ids, past_kv, layer_idx,
-                            post_hidden, post_offsets, q_pos_ids, kv_pos_ids,
-                            min_seqlen, max_seqlen, min_seqlen_post, max_seqlen_post,
+                            prefix_lens, min_seqlen_full, max_seqlen_full,
+                            post_hidden, q_pos_ids, kv_pos_ids, min_seqlen, max_seqlen,
                         )
                     else:
                         hidden = self._checkpoint_pass2_layer(
                             layer, hidden, offsets, position_ids, past_kv, layer_idx,
-                            post_hidden, post_offsets, q_pos_ids, kv_pos_ids,
-                            min_seqlen, max_seqlen, min_seqlen_post, max_seqlen_post,
+                            prefix_lens, min_seqlen_full, max_seqlen_full,
+                            post_hidden, q_pos_ids, kv_pos_ids, min_seqlen, max_seqlen,
                         )
                 else:
                     if self.gradient_checkpointing:
@@ -242,15 +235,14 @@ class PhonoP2CPreModel(PreTrainedModel):
             flat_logits = self.lm_proj(hidden)
 
             if using_cross and logits_mask is not None:
-                flat_logits = apply_logits_mask(flat_logits, offsets, post_offsets, logits_mask)
+                flat_logits = apply_logits_mask(flat_logits, logits_mask)
 
             logits_njt = _to_njt(flat_logits, offsets, min_seqlen, max_seqlen)
             if using_cross:
                 return logits_njt, None
 
             # Pack the per-layer K/V into a single nested jagged tensor with a
-            # layer axis: [B, j1, L, 2, H, D].  A single tensor argument avoids
-            # graph breaks when it crosses the two decoder passes under compile.
+            # layer axis: [B, j1, L, 2, H, D].
             kv_all = torch.stack(
                 [torch.stack([k, v], dim=1) for k, v in zip(past_k_list, past_v_list)],
                 dim=1,
@@ -307,10 +299,7 @@ class PhonoP2CPreModel(PreTrainedModel):
             logits = self.lm_proj(hidden)
 
             if using_cross and logits_mask is not None:
-                logits = apply_logits_mask_batched(
-                    logits, current_seqlen if using_cache else torch.zeros(1, dtype=torch.long, device=logits.device),
-                    post_position_offset, logits_mask,
-                )
+                logits = apply_logits_mask_batched(logits, logits_mask)
 
             if using_cache:
                 return logits, kv_cache_memory

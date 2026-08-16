@@ -13,36 +13,38 @@ def _njt(id_lists):
 
 def _sequential_logprob(pre, post, prefix_ids, pinyin_ids, combo, device):
     """Teacher-forced sequential log-prob of a full id combo (ground truth)."""
-    P, T = len(prefix_ids), len(pinyin_ids)
-    L_full = P + T
+    P = len(prefix_ids)  # full prefix length (BOS included)
+    T = len(pinyin_ids)
     prefix_t = torch.tensor([prefix_ids], dtype=torch.long, device=device)
     pinyin_t = torch.tensor([pinyin_ids], dtype=torch.long, device=device)
 
-    post_hidden, post_mask = post(pinyin_t)
+    post_hidden, post_mask = post(pinyin_t)  # [1, T, dim], [1, T, C]
 
     cache = torch.zeros(
         (pre.num_layers, 2, 1, pre.max_seqlen, pre.layers[0]["mhsa"].num_heads,
          pre.layers[0]["mhsa"].head_dim),
         device=device, dtype=torch.float32,
     )
-    _, cache = pre(prefix_t, kv_cache_memory=cache,
+    _, cache = pre(prefix_t[:, :-1], kv_cache_memory=cache,
                    current_seqlen=torch.zeros(1, dtype=torch.long, device=device))
 
+    # step 0: the last prefix token predicts the first target.
+    step0 = torch.tensor([[prefix_ids[-1]]], dtype=torch.long, device=device)
     logits, cache = pre(
-        prefix_t, kv_cache_memory=cache,
-        current_seqlen=torch.zeros(1, dtype=torch.long, device=device),
-        post_hidden=post_hidden, post_position_offset=L_full, logits_mask=post_mask,
+        step0, kv_cache_memory=cache,
+        current_seqlen=torch.full((1,), P - 1, dtype=torch.long, device=device),
+        post_hidden=post_hidden, post_position_offset=P, logits_mask=post_mask[:, 0:1],
     )
-    total = F.log_softmax(logits[0, P - 1], dim=-1)[combo[0]].item()
+    total = F.log_softmax(logits[0, 0], dim=-1)[combo[0]].item()
 
-    for t in range(1, T):
-        tok = torch.tensor([[combo[t - 1]]], dtype=torch.long, device=device)
+    for j in range(1, T):
+        tok = torch.tensor([[combo[j - 1]]], dtype=torch.long, device=device)
         logits, cache = pre(
             tok, kv_cache_memory=cache,
-            current_seqlen=torch.full((1,), P + t - 1, dtype=torch.long, device=device),
-            post_hidden=post_hidden, post_position_offset=L_full, logits_mask=post_mask,
+            current_seqlen=torch.full((1,), P - 1 + j, dtype=torch.long, device=device),
+            post_hidden=post_hidden, post_position_offset=P, logits_mask=post_mask[:, j:j + 1],
         )
-        total += F.log_softmax(logits[0, 0], dim=-1)[combo[t]].item()
+        total += F.log_softmax(logits[0, 0], dim=-1)[combo[j]].item()
     return total
 
 
@@ -115,6 +117,25 @@ def test_beam_search_returns_candidates(tiny_models):
         assert dist
         for tid, pr in dist.items():
             assert 0.0 < pr <= 1.0
+
+
+def test_beam_search_empty_prefix(tiny_models):
+    """Empty context (prefix_ids = [BOS] only) must skip the prefill."""
+    from model.beam_search import beam_search
+
+    pre, post, _, _ = tiny_models
+    device = torch.device("cpu")
+    pinyin_ids = [3, 5]
+    mask = torch.zeros(100, 250, dtype=torch.bool)
+    for p in pinyin_ids:
+        for c in range(20):
+            mask[p, c] = True
+    post.logits_mask = mask
+
+    beams = beam_search(pre, post, [0], pinyin_ids, beam_width=3, device=device)
+    assert len(beams) == 3
+    for score, ids in beams:
+        assert len(ids) == 2
 
 
 def test_topk_sentence_accuracy():

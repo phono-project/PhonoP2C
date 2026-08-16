@@ -124,7 +124,8 @@ def test_run_preprocess_end_to_end(e2e_config, tmp_path):
         tokenizer, None,
     )
     assert len(out["target_ids"][0]) == len(out["postfix_ids"][0])
-    assert out["pre_ids"][0][0] == tokenizer.spec_tokens.bos_token
+    assert out["full_prefix_ids"][0][0] == tokenizer.spec_tokens.bos_token
+    assert len(out["suffix_ids"][0]) == len(out["target_ids"][0])
 
 
 def test_preprocess_word_mode(e2e_config, tmp_path):

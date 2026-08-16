@@ -43,7 +43,6 @@ def test_char_mode_transform(tokenizer):
         ["jin", "tian", "de", "tian", "qi", "zhen", "hao", "ya"],
         [1, 1, 1, 1, 1, 1, 1, 1],
     )
-    # deterministic: golden-sequence + forward direction
     out = _run_transform(tokenizer, sample, epoch=0)
 
     k, sel, end, prefix_text, suffix_text = _expected_span(
@@ -51,15 +50,19 @@ def test_char_mode_transform(tokenizer):
     )
     assert 1 <= k <= 8
 
-    assert len(out["postfix_ids"]) == len(suffix_text)
-    assert len(out["target_ids"]) == len(suffix_text)
-    assert len(out["pre_ids"]) == 1 + len(prefix_text) + len(suffix_text)
-    # pinyin slice for the suffix
+    bos = tokenizer.spec_tokens.bos_token
+    ctx_prefix = tokenizer.encode_context(prefix_text)
+    ctx_suffix = tokenizer.encode_context(suffix_text)
+
+    assert out["full_prefix_ids"] == [bos] + ctx_prefix
+    assert out["prefix_ids"] == ([bos] + ctx_prefix[:-1] or [bos])
+    assert out["suffix_ids"] == ([bos] + ctx_prefix)[-1:] + ctx_suffix[:-1]
+    assert tokenizer.ids_to_text(out["target_ids"]) == suffix_text
+    assert out["prefix_lengths"] == len(prefix_text)
+    assert out["uncond_target_ids"] == tokenizer.encode_chinese_with_ignore(prefix_text) or [-100]
+
     pinyin_of_suffix = [tokenizer._id_to_pinyin[i] for i in out["postfix_ids"]]
     assert pinyin_of_suffix == json.loads(sample["pinyin_list"])[sel:end]
-    assert tokenizer.ids_to_text(out["target_ids"]) == suffix_text
-    assert out["pre_ids"] == [tokenizer.spec_tokens.bos_token] + \
-        tokenizer.encode_context(prefix_text) + tokenizer.encode_context(suffix_text)
 
 
 def test_word_mode_transform(tokenizer):
@@ -78,8 +81,13 @@ def test_word_mode_transform(tokenizer):
     pinyin_of_suffix = [tokenizer._id_to_pinyin[i] for i in out["postfix_ids"]]
     assert pinyin_of_suffix == json.loads(sample["pinyin_list"])[char_prefix[sel]:char_prefix[end]]
     assert tokenizer.ids_to_text(out["target_ids"]) == suffix_text
-    assert out["pre_ids"] == [tokenizer.spec_tokens.bos_token] + \
-        tokenizer.encode_context(prefix_text) + tokenizer.encode_context(suffix_text)
+
+    bos = tokenizer.spec_tokens.bos_token
+    ctx_prefix = tokenizer.encode_context(prefix_text)
+    ctx_suffix = tokenizer.encode_context(suffix_text)
+    assert out["full_prefix_ids"] == [bos] + ctx_prefix
+    assert out["suffix_ids"] == ([bos] + ctx_prefix)[-1:] + ctx_suffix[:-1]
+    assert out["prefix_lengths"] == len(prefix_text)
 
 
 def test_transform_skips_non_chinese_suffix(tokenizer):
@@ -88,14 +96,12 @@ def test_transform_skips_non_chinese_suffix(tokenizer):
         ["wo", "men", "chu", "qu", "zen", "me", "yang"],
         [1, 1, 2, 1, 1],
     )
-    # forward direction from a chinese segment never includes "BBQ"
     for epoch in range(8):
         out = _run_transform(tokenizer, sample, epoch=epoch)
         suffix = tokenizer.ids_to_text(out["target_ids"])
         assert "BBQ" not in suffix
         assert len(out["postfix_ids"]) == len(suffix) == len(out["target_ids"])
         pinyin_of_suffix = [tokenizer._id_to_pinyin[i] for i in out["postfix_ids"]]
-        # pinyin slice must match the flat list region of the suffix chars
         joined = "".join(sample["text_list"])
         idx = joined.find(suffix)
         assert idx >= 0
@@ -115,8 +121,6 @@ def test_heteronym_confusion_uses_frequency(tokenizer):
     random.seed(7)
     aug_cfg = {"drop_vowels": 0.0, "drop_last_vowel": 0.0,
                "vowels_droprate": [0.0, 1.0], "heteronym_confusion": 1.0}
-    # heteronym_confusion = 1.0 -> always sample via tokenizer.sample_heteronym
-    # (frequency: chang 0.7 / zhang 0.3)
     seen = set()
     for _ in range(40):
         out = _run_transform(tokenizer, sample, aug_cfg=aug_cfg, epoch=0)
@@ -131,14 +135,18 @@ def test_collate_and_streaming_dataset_interface(tokenizer):
 
     collate = make_collate_fn()
     items = [
-        {"pre_ids": [1, 2, 3], "postfix_ids": [4, 5], "target_ids": [6, 7]},
-        {"pre_ids": [1, 2, 3, 4, 5], "postfix_ids": [4, 5, 6, 7], "target_ids": [8, 9, 10, 11]},
+        {"full_prefix_ids": [1], "prefix_ids": [1], "suffix_ids": [4, 5],
+         "uncond_target_ids": [6], "postfix_ids": [4, 5], "target_ids": [6, 7],
+         "prefix_lengths": 1},
+        {"full_prefix_ids": [1, 2], "prefix_ids": [1, 2], "suffix_ids": [4, 5, 6, 7],
+         "uncond_target_ids": [8], "postfix_ids": [4, 5, 6, 7], "target_ids": [8, 9, 10, 11],
+         "prefix_lengths": 2},
     ]
     batch = collate(items)
-    assert set(batch.keys()) == {"pre_ids_njt", "postfix_ids_njt", "target_ids_njt"}
-    for key in batch:
-        assert batch[key].offsets().tolist() == [0, 3, 8] if key == "pre_ids_njt" \
-            else batch[key].offsets().tolist() == [0, 2, 6]
+    assert batch["prefix_ids_njt"].offsets().tolist() == [0, 1, 3]
+    assert batch["suffix_ids_njt"].offsets().tolist() == [0, 2, 6]
+    assert batch["target_ids_njt"].offsets().tolist() == [0, 2, 6]
+    assert batch["prefix_lengths"].tolist() == [1, 2]
 
 
 def test_val_transform(tokenizer):
@@ -150,10 +158,14 @@ def test_val_transform(tokenizer):
         "pinyin": [json.dumps(["tian", "qi"], ensure_ascii=False)],
     }
     out = transform_pinyin_predict_val(batch, tokenizer, None)
-    assert out["pre_ids"][0] == [tokenizer.spec_tokens.bos_token] + \
-        tokenizer.encode_context("今天") + tokenizer.encode_context("天气")
+    bos = tokenizer.spec_tokens.bos_token
+    assert out["full_prefix_ids"][0] == [bos] + tokenizer.encode_context("今天")
+    assert out["prefix_ids"][0] == [bos] + tokenizer.encode_context("今天")[:-1]
+    assert out["suffix_ids"][0] == [tokenizer.encode_context("今天")[-1]] + \
+        tokenizer.encode_context("天气")[:-1]
     assert out["postfix_ids"][0] == tokenizer.encode_pinyin(["tian", "qi"])
     assert tokenizer.ids_to_text(out["target_ids"][0]) == "天气"
+    assert out["prefix_lengths"][0] == len("今天")
 
 
 def test_chinese_segment_char_prefixes():
