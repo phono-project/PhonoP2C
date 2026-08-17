@@ -1,5 +1,5 @@
 epochs: 10
-batchsize: 2560
+batchsize: 2944
 optimizer: "adamw"    # "adamw" or "ademamix"
 learning_rate: 4e-4
 weight_decay: 1e-3
@@ -21,7 +21,10 @@ ece_top_k: 5
 # Beam search sentence-accuracy metric (top-K sentence accuracy).
 beam_width: 3
 # Samples decoded per batched beam-search call (tune to fit VRAM).
-beam_chunk_size: 512
+beam_chunk_size: 64
+# Strided sampling rate: decode every stride-th val sample (in dataset order)
+# for an even, source-unbiased subset.  Set 1 to decode every sample.
+beam_search_stride: 64
 
 # Task type is Train.
 task_type: "train"

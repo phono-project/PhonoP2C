@@ -303,6 +303,10 @@ class Trainer:
         # Number of samples decoded per batched beam-search call (controls the
         # KV-cache memory of the decode batch, B * beam_width).
         self.beam_chunk_size = cfg.task.get("beam_chunk_size", 64)
+        # Strided sampling rate for the beam-search metric: decode every
+        # stride-th sample (in dataset order) to cut computation while keeping
+        # an even, unbiased spread across sources/classes.
+        self.beam_stride = max(1, int(cfg.task.get("beam_search_stride", 4)))
 
     def _forward_batch(self, batch):
         full_prefix_njt = batch["full_prefix_ids_njt"].to(self.device)
@@ -354,9 +358,10 @@ class Trainer:
         pre_model = self.pre_model
         post_model = self.post_model
 
-        # Collect beam-search samples grouped by pinyin length so the whole
-        # test set can be decoded with a large, efficient batch.
-        beam_groups: dict[int, list] = {}
+        # Collect all beam-search samples in dataset order (so strided
+        # sampling spreads evenly across sources), then group by pinyin length
+        # so each group can be decoded with a large, efficient batch.
+        beam_samples: list[tuple] = []
 
         val_task = progress.add_task(f"[cyan]Validating Epoch {epoch + 1}/{self.cfg.task.epochs}", total=len(loader), postfix="")
 
@@ -374,17 +379,27 @@ class Trainer:
                 # Update metrics (conditional logits are the predictions)
                 metrics_acc.update(out.conditional_logits.detach(), flat_target_ids, target_offsets)
 
-                # Collect beam-search samples (grouped by pinyin length).
+                # Collect beam-search samples.
                 for prefix_t, postfix_t, target_t in zip(
                     full_prefix_njt.unbind(), postfix_njt.unbind(), target_njt.unbind()
                 ):
-                    T = int(postfix_t.numel())
-                    beam_groups.setdefault(T, []).append((prefix_t.tolist(), postfix_t.tolist(), target_t))
+                    beam_samples.append((prefix_t.tolist(), postfix_t.tolist(), target_t))
 
                 progress.update(val_task, advance=1, postfix=f"[red]loss: {out.loss.item():.4f}")
 
-        # Run batched beam search over the full test set.
+        # Strided sampling (even, unbiased spread) then group by pinyin length.
+        sampled = beam_samples[:: self.beam_stride]
+        beam_groups: dict[int, list] = {}
+        for prefix, pinyin, target in sampled:
+            beam_groups.setdefault(len(pinyin), []).append((prefix, pinyin, target))
+
+        # Standalone progress bar for the beam-search metric.
         beam_dtype = torch.bfloat16 if self.use_amp else None
+        beam_task = progress.add_task(
+            f"[cyan]S-ACC@{self.beam_width}-beam",
+            total=len(sampled),
+            postfix=f"[red]{len(sampled)} samples (1/{self.beam_stride})",
+        )
         for T, group in beam_groups.items():
             for i in range(0, len(group), self.beam_chunk_size):
                 chunk = group[i:i + self.beam_chunk_size]
@@ -397,6 +412,8 @@ class Trainer:
                         beam_width=self.beam_width, device=self.device, dtype=beam_dtype,
                     )
                 beam_acc.update_batch(beam_ids, targets)
+                progress.update(beam_task, advance=len(chunk))
+        progress.remove_task(beam_task)
 
         progress.remove_task(val_task)
 
