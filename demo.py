@@ -73,16 +73,16 @@ def predict_step(
     pinyin_ids = tokenizer.encode_pinyin(pinyin_list)
 
     if topk <= 1:
-        beams = beam_search(pre_model, post_model, prefix_ids, pinyin_ids,
-                            beam_width=1, device=device)
-        pred_ids = beams[0][1] if beams else []
+        scores, beam_ids = beam_search(pre_model, post_model, prefix_ids, pinyin_ids,
+                                       beam_width=1, device=device)
+        pred_ids = beam_ids[0].tolist() if beam_ids.numel() else []
         decoded = tokenizer.ids_to_text(pred_ids)
         return {
             "pred_ids": pred_ids,
             "decoded": decoded,
         }
 
-    beams, candidates = beam_search(
+    (scores, beam_ids), candidates = beam_search(
         pre_model, post_model, prefix_ids, pinyin_ids,
         beam_width=topk, device=device, return_candidates=True,
     )
@@ -99,7 +99,7 @@ def predict_step(
     return {
         "nbest": [
             {"score": score, "pred_ids": ids, "decoded": tokenizer.ids_to_text(ids)}
-            for score, ids in beams
+            for score, ids in zip(scores.tolist(), beam_ids.tolist())
         ],
         "per_pos": per_pos,
     }

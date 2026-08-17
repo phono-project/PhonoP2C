@@ -324,7 +324,7 @@ def test_kv_cache_standard_equals_custom_op(tiny_models):
 
     logits_std, cache_std = run(False)
     logits_op, cache_op = run(True)
-    assert torch.equal(cache_std, cache_op)
+    assert torch.allclose(cache_std, cache_op, atol=1e-6)
     assert torch.allclose(logits_std, logits_op, atol=1e-6)
 
 

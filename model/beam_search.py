@@ -3,15 +3,21 @@
 Decoding scheme (batched, KV-cache based; mirrors the non-NJT path):
 
 1. Prefill the self-attn KV cache with the context prefix ``prefix_ids[:-1]``
-   (no cross-attention) in batch size 1, then expand the cache to ``beam_size``.
-2. Encode the pinyin sequence once (batch size 1) with the post model,
-   producing the encoder hidden states and the per-position logits mask.
+   (no cross-attention).
+2. Encode the pinyin sequence once with the post model, producing the encoder
+   hidden states and the per-position logits mask.
 3. Decode autoregressively: each step feeds one token (the last prefix token,
    then the previously generated target) with cross-attention over the pinyin
    encoder and the corresponding mask row; the KV cache is updated in place.
 
-The pinyin (encoder) RoPE positions are aligned with the target positions, so
-``post_position_offset = len(prefix_ids)`` (the target/pinyin offset).
+The self-attention uses *global* per-sample positions (``current_seqlen`` is a
+``[B]`` tensor), while the cross-attention uses *local* positions (the pinyin
+key offset is 1; the query step is ``cross_q_pos_start``) — RoPE only depends
+on relative positions, so these match the training convention exactly.
+
+``beam_search_batch`` decodes a *batch* of samples (same pinyin length) with
+tensor ops only, so the full test set can be evaluated with large, efficient
+kernels instead of tiny per-sample launches.
 """
 
 from typing import Optional
@@ -35,17 +41,8 @@ def create_pre_kv_cache(pre_model, batch_size: int, device: torch.device, dtype:
     )
 
 
-def _topk_finite(lp: torch.Tensor, k: int):
-    """topk over the finite (logits-mask allowed) entries only."""
-    n_finite = int(torch.isfinite(lp).sum().item())
-    k = min(k, n_finite)
-    if k <= 0:
-        return torch.empty(0, device=lp.device), torch.empty(0, dtype=torch.long, device=lp.device)
-    return torch.topk(lp, k=k)
-
-
 def _candidate_dist(lp: torch.Tensor) -> dict[int, float]:
-    """Convert a log-prob vector into {id: prob} over finite (allowed) entries."""
+    """Convert a CPU log-prob vector into {id: prob} over finite entries."""
     finite = torch.isfinite(lp)
     ids = torch.where(finite)[0]
     vals = lp[finite]
@@ -56,6 +53,105 @@ def _candidate_dist(lp: torch.Tensor) -> dict[int, float]:
 
 
 @torch.no_grad()
+def beam_search_batch(
+    pre_model,
+    post_model,
+    prefix_ids_batch: list[list[int]],
+    pinyin_ids_batch: list[list[int]],
+    beam_width: int = 3,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+):
+    """Batched fixed-length beam search over ``B`` samples (same pinyin length).
+
+    Args:
+        pre_model: PhonoP2CPreModel (causal decoder).
+        post_model: PhonoP2CPostModel (pinyin encoder).
+        prefix_ids_batch: list of ``B`` prefix id lists (BOS included).
+        pinyin_ids_batch: list of ``B`` pinyin id lists (all the same length ``T``).
+        beam_width: number of beams kept per sample.
+        device / dtype: target device and cache/compute dtype.
+
+    Returns:
+        ``(scores, ids)`` where ``scores`` is ``[B, beam_width]`` and ``ids`` is
+        ``[B, beam_width, T]`` (chinese-vocab ids), sorted descending per sample.
+    """
+    if device is None:
+        device = next(pre_model.parameters()).device
+    if dtype is None:
+        dtype = next(pre_model.parameters()).dtype
+
+    B = len(prefix_ids_batch)
+    T = len(pinyin_ids_batch[0])
+    prefix_lens = torch.tensor([len(p) for p in prefix_ids_batch], dtype=torch.long, device=device)  # [B]
+
+    # Right-pad prefixes to P_max.
+    P_max = int(prefix_lens.max().item())
+    pad_id = prefix_ids_batch[0][0]  # the BOS token
+    padded = [p + [pad_id] * (P_max - len(p)) for p in prefix_ids_batch]
+    prefix_t = torch.tensor(padded, dtype=torch.long, device=device)  # [B, P_max]
+    pinyin_t = torch.tensor(pinyin_ids_batch, dtype=torch.long, device=device)  # [B, T]
+
+    # 1. Encode pinyin once (batched).
+    post_hidden, post_mask = post_model(pinyin_t)  # [B, T, dim], [B, T, C]
+
+    # 2. Prefill prefix[:-1] (right-padded, uniform position 0).
+    cache = create_pre_kv_cache(pre_model, B, device, dtype)
+    if P_max > 1:
+        _, cache = pre_model(
+            prefix_t[:, :-1], kv_cache_memory=cache,
+            current_seqlen=torch.zeros(B, dtype=torch.long, device=device),
+        )
+
+    # 3. Step 0: each sample's last prefix token predicts its first target char.
+    step0 = torch.tensor([p[-1] for p in prefix_ids_batch], dtype=torch.long, device=device).unsqueeze(1)  # [B, 1]
+    logits, cache = pre_model(
+        step0, kv_cache_memory=cache,
+        current_seqlen=prefix_lens - 1,
+        post_hidden=post_hidden, post_position_offset=1, cross_q_pos_start=0,
+        logits_mask=post_mask[:, 0:1],
+    )  # [B, 1, C]
+    lp = F.log_softmax(logits[:, 0, :], dim=-1)  # [B, C]
+    beam_scores, beam_ids = torch.topk(lp, k=beam_width, dim=-1)  # [B, beam_width]
+    beam_ids = beam_ids.unsqueeze(-1)  # [B, beam_width, 1]
+
+    # 4. Expand to B*beam_width and decode the remaining characters.
+    cache = cache.repeat_interleave(beam_width, dim=2)
+    post_hidden = post_hidden.repeat_interleave(beam_width, dim=0)
+    post_mask = post_mask.repeat_interleave(beam_width, dim=0)
+
+    b_idx = torch.arange(B, device=device)[:, None]  # [B, 1]
+
+    for j in range(1, T):
+        flat_prev = beam_ids[:, :, -1].reshape(-1, 1)  # [B*beam_width, 1]
+        cur_pos = (prefix_lens - 1 + j).repeat_interleave(beam_width)  # [B*beam_width]
+        logits, cache = pre_model(
+            flat_prev, kv_cache_memory=cache,
+            current_seqlen=cur_pos,
+            post_hidden=post_hidden, post_position_offset=1, cross_q_pos_start=j,
+            logits_mask=post_mask[:, j:j + 1],
+        )  # [B*beam_width, 1, C]
+        lp = F.log_softmax(logits[:, 0, :], dim=-1).view(B, beam_width, -1)  # [B, beam_width, C]
+        topk_vals, topk_ids = torch.topk(lp, k=beam_width, dim=-1)  # [B, beam_width, beam_width]
+
+        combined = beam_scores[:, :, None] + topk_vals  # [B, beam_width, beam_width]
+        top_scores, top_idx = torch.topk(combined.reshape(B, -1), k=beam_width, dim=-1)  # [B, beam_width]
+        parent = top_idx // beam_width  # [B, beam_width]
+        token = top_idx % beam_width
+        new_ids = topk_ids[b_idx, parent, token]  # [B, beam_width]
+
+        parent_ids = beam_ids[b_idx, parent]  # [B, beam_width, j]
+        beam_ids = torch.cat([parent_ids, new_ids.unsqueeze(-1)], dim=-1)  # [B, beam_width, j+1]
+        beam_scores = top_scores
+
+        # Re-index the KV cache by parent beam.
+        global_parent = (b_idx * beam_width + parent).reshape(-1)  # [B*beam_width]
+        cache = cache[:, :, global_parent]
+
+    return beam_scores, beam_ids
+
+
+@torch.no_grad()
 def beam_search(
     pre_model,
     post_model,
@@ -63,108 +159,66 @@ def beam_search(
     pinyin_ids: list[int],
     beam_width: int = 3,
     device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
     return_candidates: bool = False,
 ):
     """Fixed-length beam search over the chinese vocabulary for one sample.
 
-    Args:
-        pre_model: PhonoP2CPreModel (causal decoder).
-        post_model: PhonoP2CPostModel (pinyin encoder).
-        prefix_ids: context-vocab ids of the prefix (BOS included).
-        pinyin_ids: pinyin-vocab ids of the suffix.
-        beam_width: number of beams kept at each step.
-        device: target device; defaults to the pre model's device.
-        return_candidates: also return per-position candidate distributions
-            (max-pooled over beams) as ``list[dict[int, float]]``.
+    Thin wrapper around :func:`beam_search_batch` for a single sample.  When
+    ``return_candidates`` is set, per-position candidate distributions (used by
+    the demo's Viterbi path) are additionally computed on CPU.
 
-    Returns:
-        A list of ``(logprob_sum, chinese_id_list)`` sorted by descending
-        score.  When ``return_candidates`` is set, returns ``(beams, candidates)``.
+    Returns ``(scores, ids)`` (``[beam_width]`` / ``[beam_width, T]``), or
+    ``((scores, ids), candidates)`` when ``return_candidates`` is set.
     """
+    scores, ids = beam_search_batch(
+        pre_model, post_model, [prefix_ids], [pinyin_ids],
+        beam_width=beam_width, device=device, dtype=dtype,
+    )
+    scores = scores[0]  # [beam_width]
+    ids = ids[0]        # [beam_width, T]
+
+    if not return_candidates:
+        return scores, ids
+
+    # Recompute per-position candidates (max-pooled over beams) for the demo.
     if device is None:
         device = next(pre_model.parameters()).device
-    dtype = next(pre_model.parameters()).dtype
+    if dtype is None:
+        dtype = next(pre_model.parameters()).dtype
 
-    P = len(prefix_ids)  # full prefix length (BOS included)
+    P = len(prefix_ids)
     T = len(pinyin_ids)
-    target_offset = P  # pinyin/target position offset (= prefix_len + 1)
+    prefix_t = torch.tensor([prefix_ids], dtype=torch.long, device=device)
+    pinyin_t = torch.tensor([pinyin_ids], dtype=torch.long, device=device)
+    post_hidden, post_mask = post_model(pinyin_t)
 
-    # 1. Prefill the prefix (all but the last token), no cross-attention.
     cache = create_pre_kv_cache(pre_model, 1, device, dtype)
     if P > 1:
-        prefill_ids = torch.tensor([prefix_ids[:-1]], dtype=torch.long, device=device)  # [1, P-1]
-        _, cache = pre_model(
-            prefill_ids, kv_cache_memory=cache,
-            current_seqlen=torch.zeros(1, dtype=torch.long, device=device),
-        )
+        _, cache = pre_model(prefix_t[:, :-1], kv_cache_memory=cache,
+                             current_seqlen=torch.zeros(1, dtype=torch.long, device=device))
 
-    # 2. Expand the cache to beam_size.
+    candidates: list[dict[int, float]] = []
+    logits, cache = pre_model(
+        prefix_t[:, -1:], kv_cache_memory=cache,
+        current_seqlen=torch.full((1,), P - 1, dtype=torch.long, device=device),
+        post_hidden=post_hidden, post_position_offset=1, cross_q_pos_start=0,
+        logits_mask=post_mask[:, 0:1],
+    )
+    candidates.append(_candidate_dist(F.log_softmax(logits[0, 0], dim=-1).cpu()))
+
     cache = cache.repeat(1, 1, beam_width, 1, 1, 1)
-
-    # 3. Encode pinyin once.
-    pinyin_t = torch.tensor([pinyin_ids], dtype=torch.long, device=device)
-    post_hidden, post_mask = post_model(pinyin_t)  # [1, T, dim], [1, T, C]
     post_hidden = post_hidden.expand(beam_width, -1, -1)
     post_mask = post_mask.expand(beam_width, -1, -1)
 
-    candidates: list[dict[int, float]] = []
-
-    # 4. Step 0: the last prefix token predicts the first target char.
-    step0_input = torch.full((beam_width, 1), prefix_ids[-1], dtype=torch.long, device=device)
-    logits, cache = pre_model(
-        step0_input, kv_cache_memory=cache,
-        current_seqlen=torch.full((beam_width,), P - 1, dtype=torch.long, device=device),
-        post_hidden=post_hidden, post_position_offset=target_offset,
-        logits_mask=post_mask[:, 0:1],
-    )  # logits: [beam_width, 1, C]
-    lp = F.log_softmax(logits[0, 0], dim=-1)  # all beams identical
-    if return_candidates:
-        candidates.append(_candidate_dist(lp))
-    top_vals, top_ids = _topk_finite(lp, beam_width)
-
-    beams = []
-    for rank, (score, tid) in enumerate(zip(top_vals.tolist(), top_ids.tolist())):
-        beams.append((score, [tid], cache[:, :, rank:rank + 1].contiguous()))
-
-    # 5. Decode the remaining characters.
     for j in range(1, T):
-        if not beams:
-            break
-        B = len(beams)
-        prev_ids = torch.tensor([[b[1][-1]] for b in beams], dtype=torch.long, device=device)
-        caches = torch.cat([b[2] for b in beams], dim=2)
+        logits, cache = pre_model(
+            ids[:, j - 1:j], kv_cache_memory=cache,
+            current_seqlen=torch.full((beam_width,), P - 1 + j, dtype=torch.long, device=device),
+            post_hidden=post_hidden, post_position_offset=1, cross_q_pos_start=j,
+            logits_mask=post_mask[:, j:j + 1],
+        )
+        lp = F.log_softmax(logits[:, 0, :], dim=-1).max(dim=0).values
+        candidates.append(_candidate_dist(lp.cpu()))
 
-        logits, caches = pre_model(
-            prev_ids, kv_cache_memory=caches,
-            current_seqlen=torch.full((B,), P - 1 + j, dtype=torch.long, device=device),
-            post_hidden=post_hidden[:B], post_position_offset=target_offset,
-            logits_mask=post_mask[:B, j:j + 1],
-        )  # logits: [B, 1, C]
-        lp = F.log_softmax(logits[:, 0, :], dim=-1)  # [B, C]
-
-        if return_candidates:
-            candidates.append(_candidate_dist(lp.max(dim=0).values))
-
-        top_vals, top_ids = torch.topk(lp, k=min(beam_width, lp.size(-1)), dim=-1)
-
-        step_candidates = []
-        for b, (beam_score, beam_ids, _) in enumerate(beams):
-            row_vals = top_vals[b]
-            row_ids = top_ids[b]
-            for k in range(row_vals.numel()):
-                if not torch.isfinite(row_vals[k]):
-                    continue  # masked-out (-inf) expansion
-                step_candidates.append((
-                    beam_score + row_vals[k].item(),
-                    beam_ids + [row_ids[k].item()],
-                    caches[:, :, b:b + 1].contiguous(),
-                ))
-
-        step_candidates.sort(key=lambda x: x[0], reverse=True)
-        beams = step_candidates[:beam_width]
-
-    beams.sort(key=lambda x: x[0], reverse=True)
-    result = [(score, ids) for score, ids, _ in beams]
-    if return_candidates:
-        return result, candidates
-    return result
+    return (scores, ids), candidates

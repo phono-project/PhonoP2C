@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from model.utils import (
     RotaryEmbedding,
     apply_rotary_pos_emb,
+    apply_rotary_pos_emb_bs,
     interleave_prefix_suffix,
     make_full_offsets,
     make_local_position_ids,
@@ -27,7 +28,7 @@ from model.utils import (
     offsets_from_lens,
     scaled_dot_product_attention_njt,
 )
-from model.custom_ops import update_mhsa_kv, update_mhsa_kv_standard
+from model.custom_ops import update_mhsa_kv
 
 
 class MHSALayer(nn.Module):
@@ -187,47 +188,85 @@ class MHSALayer(nn.Module):
                 k = k.view(B, S, self.num_heads, self.head_dim).contiguous()
                 v = v.view(B, S, self.num_heads, self.head_dim).contiguous()
 
-                pos = cache_pos[0].item()
-                total_kv = pos + S
-                torch._check(pos >= 0)
-                torch._check(total_kv <= self.max_seqlen)
                 if use_custom_ops:
+                    # Export path: uniform scalar start position via the custom op.
+                    pos = cache_pos[0].item()
+                    total_kv = pos + S
+                    torch._check(pos >= 0)
+                    torch._check(total_kv <= self.max_seqlen)
                     kv_cache_full = update_mhsa_kv(kv_cache_full, k, v, pos, layer_idx)
-                else:
-                    kv_cache_full = update_mhsa_kv_standard(kv_cache_full, k, v, pos, layer_idx)
-                k_cache = kv_cache_full[layer_idx, 0]
+                    k_cache = kv_cache_full[layer_idx, 0]
+                    v_cache = kv_cache_full[layer_idx, 1]
+                    valid_k = torch.narrow(k_cache, dim=1, start=0, length=total_kv)
+                    valid_v = torch.narrow(v_cache, dim=1, start=0, length=total_kv)
+                    B_c, total_kv, _, _ = valid_k.shape
+
+                    position_ids = torch.arange(total_kv, device=hidden.device, dtype=torch.long).repeat(B_c)
+                    cos, sin = self.rotary(position_ids)
+
+                    q_pos = torch.arange(pos, pos + S, device=hidden.device, dtype=torch.long)
+                    q_cos, q_sin = self.rotary(q_pos)
+                    q = apply_rotary_pos_emb(q, q_cos, q_sin)
+
+                    valid_k_flat = valid_k.reshape(B_c * total_kv, self.num_heads, self.head_dim)
+                    valid_k_flat = apply_rotary_pos_emb(valid_k_flat.unsqueeze(0), cos, sin)
+                    valid_k = valid_k_flat.squeeze(0).reshape(B_c, total_kv, self.num_heads, self.head_dim)
+
+                    q = q.transpose(1, 2)
+                    valid_k = valid_k.transpose(1, 2)
+                    valid_v = valid_v.transpose(1, 2)
+
+                    torch._check(position_ids.shape[0] > 0)
+
+                    q_pos = torch.arange(S, device=hidden.device) + cache_pos[0]
+                    k_pos = torch.arange(total_kv, device=hidden.device)
+                    attn_mask = k_pos.unsqueeze(0) <= q_pos.unsqueeze(1)
+
+                    out = F.scaled_dot_product_attention(
+                        q, valid_k, valid_v, attn_mask=attn_mask, is_causal=False
+                    )
+                    out = out.transpose(1, 2).reshape(B, S, self.attn_dim)
+                    return self.out_proj(out), kv_cache_full
+
+                # Standard path: per-sample start positions (batched decode).
+                pos = cache_pos  # [B] int tensor (per-sample)
+                if pos.numel() == 1:
+                    pos = pos.expand(B)
+
+                # Write K/V at per-sample positions [pos_b, pos_b + S).
+                b_idx = torch.arange(B, device=hidden.device)
+                s_idx = torch.arange(S, device=hidden.device)
+                positions = pos[:, None] + s_idx[None, :]  # [B, S]
+                kv_cache_full = kv_cache_full.clone()
+                kv_cache_full[layer_idx, 0, b_idx[:, None], positions, :, :] = k
+                kv_cache_full[layer_idx, 1, b_idx[:, None], positions, :, :] = v
+
+                k_cache = kv_cache_full[layer_idx, 0]  # [B, max_seqlen, H, D]
                 v_cache = kv_cache_full[layer_idx, 1]
-                valid_k = torch.narrow(k_cache, dim=1, start=0, length=total_kv)
-                valid_v = torch.narrow(v_cache, dim=1, start=0, length=total_kv)
-                B_c, total_kv, _, _ = valid_k.shape
 
-                position_ids = torch.arange(total_kv, device=hidden.device, dtype=torch.long).repeat(B_c)
+                # RoPE the full (pre-RoPE) K window with local positions [0, max_seqlen).
+                k_pos = torch.arange(self.max_seqlen, device=hidden.device, dtype=torch.long)
+                position_ids = k_pos.repeat(B)
                 cos, sin = self.rotary(position_ids)
+                k_flat = k_cache.reshape(B * self.max_seqlen, self.num_heads, self.head_dim)
+                k_rope = apply_rotary_pos_emb(k_flat.unsqueeze(0), cos, sin)
+                k_rope = k_rope.squeeze(0).reshape(B, self.max_seqlen, self.num_heads, self.head_dim)
 
-                q_pos = torch.arange(pos, pos + S, device=hidden.device, dtype=torch.long)
-                q_cos, q_sin = self.rotary(q_pos)
-                q = apply_rotary_pos_emb(q, q_cos, q_sin)
+                # RoPE the query at per-sample positions [B, S].
+                cos_q, sin_q = self.rotary(positions.reshape(-1))
+                cos_q = cos_q.reshape(B, S, self.head_dim)
+                sin_q = sin_q.reshape(B, S, self.head_dim)
+                q = apply_rotary_pos_emb_bs(q, cos_q, sin_q)
 
-                valid_k_flat = valid_k.reshape(B_c * total_kv, self.num_heads, self.head_dim)
-                valid_k_flat = apply_rotary_pos_emb(
-                    valid_k_flat.unsqueeze(0), cos, sin
-                )
-                valid_k = valid_k_flat.squeeze(0).reshape(B_c, total_kv, self.num_heads, self.head_dim)
+                q = q.transpose(1, 2)  # [B, H, S, D]
+                k_rope = k_rope.transpose(1, 2)
+                v_cache = v_cache.transpose(1, 2)
 
-                q = q.transpose(1, 2)
-                valid_k = valid_k.transpose(1, 2)
-                valid_v = valid_v.transpose(1, 2)
-
-                torch._check(position_ids.shape[0] > 0)
-
-                q_pos = torch.arange(S, device=hidden.device) + cache_pos[0]
-                k_pos = torch.arange(total_kv, device=hidden.device)
-                attn_mask = k_pos.unsqueeze(0) <= q_pos.unsqueeze(1)
-
+                # Causal mask: sample b's query at q_pos attends to k positions <= q_pos.
+                attn_mask = k_pos[None, None, :] <= positions[:, :, None]  # [B, S, max_seqlen]
                 out = F.scaled_dot_product_attention(
-                    q, valid_k, valid_v, attn_mask=attn_mask, is_causal=False
+                    q, k_rope, v_cache, attn_mask=attn_mask.unsqueeze(1), is_causal=False
                 )
-
                 out = out.transpose(1, 2).reshape(B, S, self.attn_dim)
                 return self.out_proj(out), kv_cache_full
 

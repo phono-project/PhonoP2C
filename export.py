@@ -161,8 +161,9 @@ dummy_post_hidden = torch.zeros(
 dummy_logits_mask = torch.ones(
     (BATCH_SIZE, dummy_new_prefix_len, pre_cfg.proj_size), dtype=torch.bool
 )
-# Target/pinyin position offset = len(prefix_ids) = (prefix_len + 1).
-dummy_post_position_offset = dummy_current_seqlen + 1
+# Local cross-attn positions: pinyin key offset 1, query step = chunk start.
+dummy_post_position_offset = 1
+dummy_cross_q_pos_start = 0
 
 pre2_example_kwargs = {
     "input_ids": dummy_pre_input_ids,
@@ -170,6 +171,7 @@ pre2_example_kwargs = {
     "current_seqlen": dummy_pre_cache_pos,
     "post_hidden": dummy_post_hidden,
     "post_position_offset": dummy_post_position_offset,
+    "cross_q_pos_start": dummy_cross_q_pos_start,
     "logits_mask": dummy_logits_mask,
     "use_custom_ops": True,
 }
@@ -180,6 +182,7 @@ pre2_dynamic_shapes = {
     "current_seqlen": None,
     "post_hidden": {1: Dim("post_len2", min=1, max=post_cfg.max_seqlen)},
     "post_position_offset": None,
+    "cross_q_pos_start": None,
     "logits_mask": {1: chunk_len_dim},
     "use_custom_ops": None,
 }

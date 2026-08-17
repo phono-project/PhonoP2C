@@ -164,8 +164,8 @@ class TopKSentenceAccuracy:
     Usage::
 
         acc = TopKSentenceAccuracy(k=3)
-        for beams, target in ...:
-            acc.update(beams, target)   # beams: list[list[list[int]]]
+        for beam_ids, target in ...:
+            acc.update(beam_ids, target)  # tensors: [k, T] and [T]
         top3_s_acc = acc.compute()
     """
 
@@ -173,16 +173,34 @@ class TopKSentenceAccuracy:
         self.k = k
         self.reset()
 
-    def update(self, beams: list[list[list[int]]], target: list[int]) -> None:
+    def update(self, beams, target) -> None:
         """Ingest one sample.
 
         Args:
-            beams: the (up to k) decoded id sequences for one sentence.
-            target: the ground-truth id sequence.
+            beams: the (up to k) decoded id sequences, ``[k, T]`` int tensor
+                (or a nested list of ids).
+            target: the ground-truth id sequence, ``[T]`` int tensor (or list).
         """
         self._total_sentences += 1
-        if any(list(hyp) == list(target) for hyp in beams[: self.k]):
+        if isinstance(beams, torch.Tensor):
+            beams_t = beams
+            target_t = target if isinstance(target, torch.Tensor) else torch.tensor(target, device=beams.device)
+            correct = bool((beams_t[: self.k] == target_t.unsqueeze(0)).all(dim=-1).any())
+        else:
+            correct = any(list(hyp) == list(target) for hyp in beams[: self.k])
+        if correct:
             self._correct_sentences += 1
+
+    def update_batch(self, beams, targets) -> None:
+        """Ingest a batch of samples in a single device-side reduction.
+
+        Args:
+            beams: ``[B, k, T]`` int tensor of decoded hypotheses.
+            targets: ``[B, T]`` int tensor of ground-truth sequences.
+        """
+        correct = (beams[:, : self.k] == targets.unsqueeze(1)).all(dim=-1).any(dim=-1)
+        self._correct_sentences += int(correct.sum().item())
+        self._total_sentences += int(beams.shape[0])
 
     def compute(self) -> float:
         if self._total_sentences == 0:

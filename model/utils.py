@@ -51,6 +51,13 @@ def apply_rotary_pos_emb(v: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
     return embed
 
 
+def apply_rotary_pos_emb_bs(v: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    """RoPE for a batched [B, S, H, D] tensor with per-position [B, S, D] freqs."""
+    cos = cos.unsqueeze(2).to(v.dtype)  # [B, S, 1, D]
+    sin = sin.unsqueeze(2).to(v.dtype)
+    return (v * cos) + (rotate_half(v) * sin)
+
+
 def make_local_position_ids(offsets: torch.Tensor) -> torch.Tensor:
     """Per-sequence local position ids for a jagged layout.
 

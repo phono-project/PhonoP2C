@@ -1,9 +1,9 @@
 train:
-  log_with_wandb: true
+  log_with_wandb: false
   project_name: "PhonoP2C"
   run_name: "V2.0-Base-Alpha-03"
   notes: "In V2.0 alpha 03, a significant architectural correction was applied."
   checkpoint_dir: "./checkpoints/v2_0-base-alpha03"
   histogram_interval: 10000
-  val_interval: 5000
+  val_interval: 5
   save_interval: 1

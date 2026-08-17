@@ -38,7 +38,7 @@ from datasets_pipeline import (
 from model.config import build_configs_from_dict
 from model.model import PhonoP2CPreModel, PhonoP2CPostModel
 from model.wrapper import PhonoP2CTrainWrapper
-from model.beam_search import beam_search
+from model.beam_search import beam_search_batch
 from tokenizer import P2CTokenizer
 
 from torchao.float8 import Float8LinearConfig, convert_to_float8_training
@@ -300,33 +300,47 @@ class Trainer:
 
         # Beam search metric settings
         self.beam_width = cfg.task.get("beam_width", 3)
-        self.beam_max_samples = cfg.task.get("beam_search_max_samples", 256)
+        # Number of samples decoded per batched beam-search call (controls the
+        # KV-cache memory of the decode batch, B * beam_width).
+        self.beam_chunk_size = cfg.task.get("beam_chunk_size", 64)
 
     def _forward_batch(self, batch):
-        pre_njt = batch["pre_ids_njt"].to(self.device)
+        full_prefix_njt = batch["full_prefix_ids_njt"].to(self.device)
+        prefix_njt = batch["prefix_ids_njt"].to(self.device)
+        suffix_njt = batch["suffix_ids_njt"].to(self.device)
+        uncond_target_njt = batch["uncond_target_ids_njt"].to(self.device)
         postfix_njt = batch["postfix_ids_njt"].to(self.device)
         target_njt = batch["target_ids_njt"].to(self.device)
+        prefix_lens = batch["prefix_lengths"].to(self.device)
 
-        flat_pre_ids = pre_njt.values()
-        pre_offsets = pre_njt.offsets()
-        flat_postfix_ids = postfix_njt.values()
-        postfix_offsets = postfix_njt.offsets()
+        flat_prefix = prefix_njt.values()
+        prefix_offsets = prefix_njt.offsets()
+        flat_suffix = suffix_njt.values()
+        suffix_offsets = suffix_njt.offsets()
+        flat_uncond_target = uncond_target_njt.values()
+        flat_postfix = postfix_njt.values()
         flat_target_ids = target_njt.values()
 
-        pre_seq_lens = pre_offsets[1:] - pre_offsets[:-1]
-        min_sl_pre = pre_seq_lens.min().item()
-        max_sl_pre = pre_seq_lens.max().item()
+        prefix_seq_lens = prefix_offsets[1:] - prefix_offsets[:-1]
+        min_sl_prefix = prefix_seq_lens.min().item()
+        max_sl_prefix = prefix_seq_lens.max().item()
 
-        postfix_seq_lens = postfix_offsets[1:] - postfix_offsets[:-1]
-        min_sl_post = postfix_seq_lens.min().item()
-        max_sl_post = postfix_seq_lens.max().item()
+        suffix_seq_lens = suffix_offsets[1:] - suffix_offsets[:-1]
+        min_sl_suffix = suffix_seq_lens.min().item()
+        max_sl_suffix = suffix_seq_lens.max().item()
+
+        full_lens = prefix_lens + suffix_seq_lens
+        min_sl_full = full_lens.min().item()
+        max_sl_full = full_lens.max().item()
 
         out = self.model(
-            flat_pre_ids, pre_offsets, flat_postfix_ids, postfix_offsets,
-            flat_target_ids, min_sl_pre, max_sl_pre, min_sl_post, max_sl_post,
+            flat_prefix, prefix_offsets, flat_suffix, suffix_offsets,
+            flat_postfix, flat_uncond_target, flat_target_ids, prefix_lens,
+            min_sl_prefix, max_sl_prefix, min_sl_suffix, max_sl_suffix,
+            min_sl_full, max_sl_full,
         )
 
-        return out, flat_target_ids, postfix_offsets, pre_njt, postfix_njt, target_njt
+        return out, flat_target_ids, suffix_offsets, full_prefix_njt, postfix_njt, target_njt
 
     def validate(self, model, loader, epoch, global_step, progress):
         model.eval()
@@ -336,17 +350,20 @@ class Trainer:
         val_loss_sum = 0.0
         val_uncond_loss_sum = 0.0
         val_cond_loss_sum = 0.0
-        beam_samples_done = 0
 
         pre_model = self.pre_model
         post_model = self.post_model
+
+        # Collect beam-search samples grouped by pinyin length so the whole
+        # test set can be decoded with a large, efficient batch.
+        beam_groups: dict[int, list] = {}
 
         val_task = progress.add_task(f"[cyan]Validating Epoch {epoch + 1}/{self.cfg.task.epochs}", total=len(loader), postfix="")
 
         with torch.no_grad():
             for batch in loader:
                 with torch.amp.autocast(self.device.type, dtype=torch.bfloat16, enabled=self.use_amp):
-                    out, flat_target_ids, target_offsets, pre_njt, postfix_njt, target_njt = \
+                    out, flat_target_ids, target_offsets, full_prefix_njt, postfix_njt, target_njt = \
                         self._forward_batch(batch)
 
                 val_loss_sum += out.loss.item()
@@ -357,26 +374,29 @@ class Trainer:
                 # Update metrics (conditional logits are the predictions)
                 metrics_acc.update(out.conditional_logits.detach(), flat_target_ids, target_offsets)
 
-                # Top-K sentence accuracy via beam search
-                if beam_samples_done < self.beam_max_samples:
-                    for prefix_t, postfix_t, target_t in zip(
-                        pre_njt.unbind(), postfix_njt.unbind(), target_njt.unbind()
-                    ):
-                        if beam_samples_done >= self.beam_max_samples:
-                            break
-                        target_ids = target_t.tolist()
-                        # decoder input = [BOS + context] + target; strip the
-                        # target part to obtain the context prefix
-                        prefix_ids = prefix_t.tolist()[:-len(target_ids)]
-                        beams = beam_search(
-                            pre_model, post_model,
-                            prefix_ids, postfix_t.tolist(),
-                            beam_width=self.beam_width, device=self.device,
-                        )
-                        beam_acc.update([b[1] for b in beams], target_ids)
-                        beam_samples_done += 1
+                # Collect beam-search samples (grouped by pinyin length).
+                for prefix_t, postfix_t, target_t in zip(
+                    full_prefix_njt.unbind(), postfix_njt.unbind(), target_njt.unbind()
+                ):
+                    T = int(postfix_t.numel())
+                    beam_groups.setdefault(T, []).append((prefix_t.tolist(), postfix_t.tolist(), target_t))
 
                 progress.update(val_task, advance=1, postfix=f"[red]loss: {out.loss.item():.4f}")
+
+        # Run batched beam search over the full test set.
+        beam_dtype = torch.bfloat16 if self.use_amp else None
+        for T, group in beam_groups.items():
+            for i in range(0, len(group), self.beam_chunk_size):
+                chunk = group[i:i + self.beam_chunk_size]
+                prefixes = [c[0] for c in chunk]
+                pinyins = [c[1] for c in chunk]
+                targets = torch.stack([c[2] for c in chunk])
+                with torch.amp.autocast(self.device.type, dtype=torch.bfloat16, enabled=self.use_amp):
+                    _, beam_ids = beam_search_batch(
+                        pre_model, post_model, prefixes, pinyins,
+                        beam_width=self.beam_width, device=self.device, dtype=beam_dtype,
+                    )
+                beam_acc.update_batch(beam_ids, targets)
 
         progress.remove_task(val_task)
 

@@ -160,6 +160,7 @@ class PhonoP2CPreModel(PreTrainedModel):
                 min_seqlen_full=None, max_seqlen_full=None,
                 post_hidden=None, logits_mask=None,
                 post_position_offset=None,
+                cross_q_pos_start=None,
                 use_custom_ops=False):
         """Decoder forward.
 
@@ -172,9 +173,12 @@ class PhonoP2CPreModel(PreTrainedModel):
               with the logits masked 1:1 by ``logits_mask``.
 
         Batched path (``offsets=None``): incremental decode/prefill with the
-            self-attn KV cache (``kv_cache_memory`` + ``current_seqlen``);
-            ``post_position_offset`` is the target/pinyin position offset
-            (``len(prefix_ids)`` = ``prefix_len + 1``).
+            self-attn KV cache (``kv_cache_memory`` + ``current_seqlen``, the
+            latter a per-sample ``[B]`` start-position tensor).  The
+            cross-attention uses *local* positions: ``cross_q_pos_start`` is the
+            current suffix step (0..T-1) and ``post_position_offset`` the pinyin
+            key offset (1, since pinyin is aligned with the target that is one
+            position ahead of the query).
 
         ``use_custom_ops`` routes the in-place KV-cache update through the
         ``phono::update_mhsa_kv`` torch.library op (ExecuTorch export only);
@@ -184,7 +188,7 @@ class PhonoP2CPreModel(PreTrainedModel):
         using_cache = kv_cache_memory is not None and current_seqlen is not None
 
         if using_cross and post_position_offset is None and offsets is None:
-            raise ValueError("Batched pass 2 requires post_position_offset (target/pinyin offset).")
+            raise ValueError("Batched pass 2 requires post_position_offset (pinyin key offset).")
 
         if offsets is not None:
             # --------------------------- NJT path ---------------------------
@@ -257,7 +261,9 @@ class PhonoP2CPreModel(PreTrainedModel):
             hidden = self.embed(input_ids)
             B, S = hidden.shape[:2]
 
-            q_pos_start = current_seqlen[0].item() if using_cache else 0
+            # Cross-attention uses local positions: the current suffix step
+            # (query) and the pinyin key offset (1).
+            cross_q_start = cross_q_pos_start if (using_cross and cross_q_pos_start is not None) else 0
             kv_pos_offset = post_position_offset if using_cross else None
 
             plain_past_kv = []
@@ -285,7 +291,7 @@ class PhonoP2CPreModel(PreTrainedModel):
                     hidden = layer["norm2"](hidden)
                     hidden = layer["mhca"](
                         hidden, enc_hidden=post_hidden,
-                        q_pos_start=q_pos_start,
+                        q_pos_start=cross_q_start,
                         kv_pos_offset=kv_pos_offset,
                     )
                     hidden = hidden + residual
