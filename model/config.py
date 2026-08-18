@@ -35,7 +35,6 @@ class PreModelConfig(PretrainedConfig):
         proj_size: int = 10000,
         mhca_heads: int = 4,
         mhca_attn_dim: int = 256,
-        post_max_seqlen: int = 32,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -54,8 +53,6 @@ class PreModelConfig(PretrainedConfig):
         # live under the post_model section of the YAML config.
         self.mhca_heads = mhca_heads
         self.mhca_attn_dim = mhca_attn_dim
-        # Encoder sequence length bound (post model max_seqlen).
-        self.post_max_seqlen = post_max_seqlen
 
 
 class PostModelConfig(PretrainedConfig):
@@ -113,9 +110,8 @@ def build_configs_from_dict(d: dict, vocab_sizes: dict) -> tuple[PreModelConfig,
         ffn_common_dim=pre_d.get("ffn_common_dim", 4096),
         vocab_size=vocab_sizes["context"],
         proj_size=vocab_sizes["chinese"],
-        mhca_heads=post_d.get("mhca_heads", post_d.get("mhsa_heads", 4)),
-        mhca_attn_dim=post_d.get("mhca_attn_dim", common.get("model_dim", 768)),
-        post_max_seqlen=post_d.get("max_seqlen", 32),
+        mhca_heads=pre_d.get("mhca_heads", post_d.get("mhsa_heads", 4)),
+        mhca_attn_dim=pre_d.get("mhca_attn_dim", common.get("model_dim", 768)),
     )
     post_cfg = PostModelConfig(
         model_dim=common.get("model_dim", 768),

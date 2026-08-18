@@ -85,7 +85,6 @@ class PhonoP2CPreModel(PreTrainedModel):
         self.embed = nn.Embedding(config.vocab_size, dim)
         self.num_layers = config.mhsa_layers
         self.max_seqlen = config.max_seqlen
-        self.post_max_seqlen = config.post_max_seqlen
         self.gradient_checkpointing = False
 
         self.layers = nn.ModuleList([])

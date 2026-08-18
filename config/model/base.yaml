@@ -7,6 +7,7 @@ pre_model:
   mhsa_layers: 8
   mhsa_heads: 4
   attn_dim: 256
+  mhca_heads: 4
   mhca_attn_dim: 256
   ffn_common_dim: 2048
 
@@ -15,5 +16,4 @@ post_model:
   mhsa_layers: 4
   mhsa_heads: 4
   attn_dim: 256
-  mhca_heads: 4
   ffn_common_dim: 2048

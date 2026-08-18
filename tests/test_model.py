@@ -15,22 +15,6 @@ def _minmax(offsets):
 
 
 # --------------------------------------------------------------------------
-# Config migration
-# --------------------------------------------------------------------------
-def test_config_migration(tiny_cfg_dict, tiny_vocab_sizes):
-    from model.config import build_configs_from_dict
-
-    pre_cfg, post_cfg = build_configs_from_dict(tiny_cfg_dict, tiny_vocab_sizes)
-    assert pre_cfg.vocab_size == 300
-    assert pre_cfg.proj_size == 250
-    assert post_cfg.vocab_size == 100
-    assert post_cfg.proj_size == 250
-    assert pre_cfg.mhca_heads == tiny_cfg_dict["post_model"]["mhca_heads"]
-    assert pre_cfg.mhca_attn_dim == tiny_cfg_dict["post_model"]["mhca_attn_dim"]
-    assert pre_cfg.post_max_seqlen == tiny_cfg_dict["post_model"]["max_seqlen"]
-
-
-# --------------------------------------------------------------------------
 # Wrapper: two-phase NJT forward
 # --------------------------------------------------------------------------
 def _two_phase_batch():

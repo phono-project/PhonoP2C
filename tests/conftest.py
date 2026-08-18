@@ -19,10 +19,11 @@ def tiny_cfg_dict():
         "pre_model": {
             "max_seqlen": 64, "mhsa_layers": 2, "mhsa_heads": 2,
             "attn_dim": 16, "ffn_common_dim": 32,
+            "mhca_heads": 2, "mhca_attn_dim": 16,
         },
         "post_model": {
             "max_seqlen": 32, "mhsa_layers": 2, "mhsa_heads": 2,
-            "attn_dim": 16, "mhca_heads": 2, "mhca_attn_dim": 16,
+            "attn_dim": 16, 
             "ffn_common_dim": 32,
         },
     }
