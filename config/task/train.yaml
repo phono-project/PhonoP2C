@@ -9,10 +9,10 @@ compile_model: true
 compile_mode: 'default'
 
 # Loss function.
-loss_type: "focal" # "ce" or "focal"
+loss_type: "ce" # "ce" or "focal"
 # label_smoothing_epsilon: 0.1
-focal_loss_gamma: 1.0
-focal_loss_alpha: 0.5
+# focal_loss_gamma: 1.0
+# focal_loss_alpha: 0.5
 
 # validation
 ece_bins: 15
@@ -24,7 +24,7 @@ beam_width: 3
 beam_chunk_size: 64
 # Strided sampling rate: decode every stride-th val sample (in dataset order)
 # for an even, source-unbiased subset.  Set 1 to decode every sample.
-beam_search_stride: 64
+beam_search_stride: 32
 
 # Task type is Train.
 task_type: "train"
