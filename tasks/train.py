@@ -424,7 +424,6 @@ class Trainer:
         avg_cond_loss = val_cond_loss_sum / max(val_steps, 1)
         m = metrics_acc.compute()
         topk_s_acc = beam_acc.compute()
-        avg_val_ppl = math.exp(avg_val_loss) if avg_val_loss < 20 else float('inf')
 
         if self.log_cfg.log_with_wandb:
             wandb.log({
@@ -439,12 +438,7 @@ class Trainer:
                 "val/ECE": m["ece"],
             }, step=global_step)
 
-        if self.log_cfg.log_with_wandb and self.loss_type == "ce":
-            wandb.log({
-                "val/PPL": avg_val_ppl
-            }, step=global_step)
-
-        return avg_val_loss, avg_val_ppl, m
+        return avg_val_loss, m
 
     def train(self):
         model = self.model
@@ -499,7 +493,7 @@ class Trainer:
 
                     # Validation
                     if (global_step % self.log_cfg.val_interval == 0) or (global_step == self.total_steps):
-                        avg_val_loss, avg_val_ppl, _metrics = self.validate(
+                        avg_val_loss, _metrics = self.validate(
                             model, self.val_loader, epoch, global_step, progress
                         )
 
