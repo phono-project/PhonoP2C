@@ -138,6 +138,19 @@ class Trainer:
         self.post_model = PhonoP2CPostModel(self.post_cfg).to(self.device)
         self.post_model.logits_mask = logits_mask
 
+        load_from = cfg.task.get("load_from")
+        if load_from:
+            pre_path = os.path.join(load_from, "pre_model")
+            post_path = os.path.join(load_from, "post_model")
+            if not os.path.isdir(pre_path) or not os.path.isdir(post_path):
+                raise FileNotFoundError(
+                    f"Checkpoint {load_from!r} must contain pre_model/ and post_model/"
+                )
+            self.pre_model = PhonoP2CPreModel.from_pretrained(pre_path).to(self.device)
+            self.post_model = PhonoP2CPostModel.from_pretrained(post_path).to(self.device)
+            self.post_model.logits_mask = logits_mask
+            print(f"Loaded model parameters from {load_from}")
+
         total_params = (sum(p.numel() for p in self.pre_model.parameters()) +
                         sum(p.numel() for p in self.post_model.parameters()))
         print(f"Pre model:  {sum(p.numel() for p in self.pre_model.parameters()) / 1e6:.2f}M params")
@@ -318,6 +331,17 @@ class Trainer:
             num_training_steps=self.total_steps,
             min_lr_ratio=cfg.task.min_learning_rate / cfg.task.max_learning_rate,
         )
+
+        if load_from:
+            optimizer_path = os.path.join(load_from, "optim_state", "optimizer.pt")
+            if not os.path.isfile(optimizer_path):
+                raise FileNotFoundError(f"Checkpoint {load_from!r} is missing optim_state/optimizer.pt")
+            self.optim.load_state_dict(torch.load(optimizer_path, map_location=self.device))
+
+            scheduler_path = os.path.join(load_from, "optim_state", "scheduler.pt")
+            if os.path.isfile(scheduler_path):
+                self.schd.load_state_dict(torch.load(scheduler_path, map_location=self.device))
+            print(f"Loaded optimizer state from {load_from}")
         self.use_amp = cfg.system.mixed_precision == "bf16"
 
         # Beam search metric settings
@@ -329,6 +353,22 @@ class Trainer:
         # stride-th sample (in dataset order) to cut computation while keeping
         # an even, unbiased spread across sources/classes.
         self.beam_stride = max(1, int(cfg.task.get("beam_search_stride", 4)))
+
+    def _save_checkpoint(self, save_path: str) -> None:
+        pre_to_save = self.pre_model._orig_mod if hasattr(self.pre_model, "_orig_mod") else self.pre_model
+        post_to_save = self.post_model._orig_mod if hasattr(self.post_model, "_orig_mod") else self.post_model
+
+        pre_to_save.save_pretrained(os.path.join(save_path, "pre_model"), safe_serialization=True)
+        post_to_save.save_pretrained(os.path.join(save_path, "post_model"), safe_serialization=True)
+
+        optim_path = os.path.join(save_path, "optim_state")
+        os.makedirs(optim_path, exist_ok=True)
+        torch.save(self.optim.state_dict(), os.path.join(optim_path, "optimizer.pt"))
+        torch.save(self.schd.state_dict(), os.path.join(optim_path, "scheduler.pt"))
+
+        config_path = os.path.join(save_path, "configs")
+        os.makedirs(config_path, exist_ok=True)
+        OmegaConf.save(self.cfg, os.path.join(config_path, "config.yaml"), resolve=True)
 
     def _forward_batch(self, batch):
         full_prefix_njt = batch["full_prefix_ids_njt"].to(self.device)
@@ -534,20 +574,10 @@ class Trainer:
                 # Pre and post models are saved individually
                 if (epoch + 1) % self.log_cfg.save_interval == 0:
                     save_path = os.path.join(self.checkpoint_dir, f"epoch_{epoch + 1}")
-
-                    pre_to_save = self.pre_model._orig_mod if hasattr(self.pre_model, "_orig_mod") else self.pre_model
-                    post_to_save = self.post_model._orig_mod if hasattr(self.post_model, "_orig_mod") else self.post_model
-
-                    pre_to_save.save_pretrained(os.path.join(save_path, "pre_model"), safe_serialization=True)
-                    post_to_save.save_pretrained(os.path.join(save_path, "post_model"), safe_serialization=True)
+                    self._save_checkpoint(save_path)
 
         save_path = os.path.join(self.checkpoint_dir, "final_model")
-
-        pre_to_save = self.pre_model._orig_mod if hasattr(self.pre_model, "_orig_mod") else self.pre_model
-        post_to_save = self.post_model._orig_mod if hasattr(self.post_model, "_orig_mod") else self.post_model
-
-        pre_to_save.save_pretrained(os.path.join(save_path, "pre_model"), safe_serialization=True)
-        post_to_save.save_pretrained(os.path.join(save_path, "post_model"), safe_serialization=True)
+        self._save_checkpoint(save_path)
 
         if self.log_cfg.log_with_wandb:
             wandb.finish()

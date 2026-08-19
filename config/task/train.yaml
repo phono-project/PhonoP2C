@@ -1,3 +1,5 @@
+# load model parameters and optimizers to be the initial state if specified.
+load_from: null
 epochs: 10
 batchsize: 2944
 optimizer: "adamw"    # "adamw" or "ademamix"
