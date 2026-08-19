@@ -15,7 +15,7 @@ import logging
 
 import torch
 import bitsandbytes as bnb
-from transformers import get_scheduler
+from transformers import get_wsd_schedule
 import wandb
 from streaming import StreamingDataLoader
 from omegaconf import DictConfig, OmegaConf
@@ -271,31 +271,53 @@ class Trainer:
         if cfg.task.optimizer == "adamw":
             if cfg.system.optim_8bit:
                 if cfg.system.optim_paged:
-                    self.optim = bnb.optim.PagedAdamW8bit(param_groups, lr=cfg.task.learning_rate, weight_decay=cfg.task.weight_decay)
+                    self.optim = bnb.optim.PagedAdamW8bit(
+                        param_groups,
+                        lr=cfg.task.max_learning_rate,
+                        weight_decay=cfg.task.weight_decay,
+                        betas=tuple(cfg.task.betas),
+                    )
                 else:
-                    self.optim = bnb.optim.AdamW8bit(param_groups, lr=cfg.task.learning_rate, weight_decay=cfg.task.weight_decay)
+                    self.optim = bnb.optim.AdamW8bit(
+                        param_groups,
+                        lr=cfg.task.max_learning_rate,
+                        weight_decay=cfg.task.weight_decay,
+                        betas=tuple(cfg.task.betas),
+                    )
             else:
                 if cfg.system.optim_paged:
-                    self.optim = bnb.optim.PagedAdamW32bit(param_groups, lr=cfg.task.learning_rate, weight_decay=cfg.task.weight_decay)
+                    self.optim = bnb.optim.PagedAdamW32bit(
+                        param_groups,
+                        lr=cfg.task.max_learning_rate,
+                        weight_decay=cfg.task.weight_decay,
+                        betas=tuple(cfg.task.betas),
+                    )
                 else:
-                    self.optim = bnb.optim.AdamW32bit(param_groups, lr=cfg.task.learning_rate, weight_decay=cfg.task.weight_decay)
-            self.schd = get_scheduler(
-                "cosine", self.optim, num_warmup_steps=warmup_steps, num_training_steps=self.total_steps
-            )
+                    self.optim = bnb.optim.AdamW32bit(
+                        param_groups,
+                        lr=cfg.task.max_learning_rate,
+                        weight_decay=cfg.task.weight_decay,
+                        betas=tuple(cfg.task.betas),
+                    )
         elif cfg.task.optimizer == "ademamix":
             if cfg.system.optim_8bit:
                 if cfg.system.optim_paged:
-                    self.optim = bnb.optim.PagedAdEMAMix8bit(param_groups, lr=cfg.task.learning_rate, weight_decay=cfg.task.weight_decay)
+                    self.optim = bnb.optim.PagedAdEMAMix8bit(param_groups, lr=cfg.task.max_learning_rate, weight_decay=cfg.task.weight_decay)
                 else:
-                    self.optim = bnb.optim.PagedAdEMAMix8bit(param_groups, lr=cfg.task.learning_rate, weight_decay=cfg.task.weight_decay)
+                    self.optim = bnb.optim.PagedAdEMAMix8bit(param_groups, lr=cfg.task.max_learning_rate, weight_decay=cfg.task.weight_decay)
             else:
                 if cfg.system.optim_paged:
-                    self.optim = bnb.optim.PagedAdEMAMix32bit(param_groups, lr=cfg.task.learning_rate, weight_decay=cfg.task.weight_decay)
+                    self.optim = bnb.optim.PagedAdEMAMix32bit(param_groups, lr=cfg.task.max_learning_rate, weight_decay=cfg.task.weight_decay)
                 else:
-                    self.optim = bnb.optim.PagedAdEMAMix32bit(param_groups, lr=cfg.task.learning_rate, weight_decay=cfg.task.weight_decay)
-            self.schd = get_scheduler(
-                "cosine", self.optim, num_warmup_steps=warmup_steps, num_training_steps=self.total_steps
-            )
+                    self.optim = bnb.optim.PagedAdEMAMix32bit(param_groups, lr=cfg.task.max_learning_rate, weight_decay=cfg.task.weight_decay)
+
+        self.schd = get_wsd_schedule(
+            self.optim,
+            num_warmup_steps=warmup_steps,
+            num_decay_steps=cfg.task.decay_steps,
+            num_training_steps=self.total_steps,
+            min_lr_ratio=cfg.task.min_learning_rate / cfg.task.max_learning_rate,
+        )
         self.use_amp = cfg.system.mixed_precision == "bf16"
 
         # Beam search metric settings
