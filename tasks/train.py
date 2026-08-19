@@ -511,6 +511,8 @@ class Trainer:
 
         with progress:
             epoch_task = progress.add_task("[yellow]Epochs", total=cfg.task.epochs, postfix="")
+            decay_start_step = max(0, self.total_steps - cfg.task.decay_steps)
+            before_decay_saved = False
 
             for epoch in range(cfg.task.epochs):
 
@@ -521,6 +523,9 @@ class Trainer:
                 )
 
                 for batch in self.train_loader:
+                    if not before_decay_saved and global_step == decay_start_step:
+                        self._save_checkpoint(os.path.join(self.checkpoint_dir, "before_decay"))
+                        before_decay_saved = True
 
                     self.optim.zero_grad()
 
