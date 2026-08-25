@@ -101,8 +101,8 @@ if __name__ == "__main__":
     device = torch.device("cpu")
     dtype = torch.float32
 
-    checkpoint_dir = "./checkpoints/v2_0-base-alpha03/epoch_3"
-    n_best = 5
+    checkpoint_dir = "./checkpoints/v2_0-base-alpha05/final_model"
+    n_best = 3
 
     # Load tokenizer
     tokenizer = P2CTokenizer.from_config("./vocabs/config.yaml")
@@ -115,8 +115,8 @@ if __name__ == "__main__":
     post_model.to(dtype)
 
     # Test inference
-    text = ""
-    pinyin_list = "o mei kai dan mu ji wo cao".split()  # expected "乱吗" not "乱码"
+    text = "这真的不会"
+    pinyin_list = "luan ma".split()  # expected "乱吗" not "乱码"
 
     print(f"\nPrefix: '{text}'")
     print(f"Pinyin: {pinyin_list}")
@@ -130,13 +130,16 @@ if __name__ == "__main__":
     elapsed = (time.perf_counter_ns() - start) / 1e9
     print(f"Greedy: ids={result['pred_ids']}, decoded='{result['decoded']}'")
     print(f"Time: {elapsed:.4f}s")
-
+    
+    start = time.perf_counter_ns()
     # Beam search top-k
     result5 = predict_step(
         text, pinyin_list,
         pre_model, post_model, tokenizer, device,
-        topk=5,
+        topk=n_best,
     )
+    elapsed = (time.perf_counter_ns() - start) / 1e9
     print(f"\nTop-5 beams:")
     for rank, entry in enumerate(result5["nbest"]):
         print(f"  [{rank+1}] score={entry['score']:.4f} '{entry['decoded']}'")
+    print(F"Time: {elapsed:.4f}s")
