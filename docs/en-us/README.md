@@ -4,8 +4,8 @@
 
 PhonoP2C (Fast Pinyin-to-Chinese) is a research sub-project of the PhonoP2C-collection. It implements a **Pinyin-to-Chinese (P2C) conversion model** built on a two-stage "PostfixLM" architecture:
 
-- **PhonoP2CPreModel** — a causal (left-to-right) encoder that reads the Chinese context prefix already typed by the user (plus punctuation and other non-Chinese symbols), and produces a shared Key/Value projection consumed by the post model.
-- **PhonoP2CPostModel** — a bidirectional decoder that reads the pinyin syllables the user typed, attends over the pre model's context representation, and predicts the Chinese characters. Candidate characters are restricted by a **pinyin->Chinese possibility mask**, and the final output can be refined with **dictionary-constrained Viterbi N-best decoding**.
+- **PhonoP2CPreModel** — a causal decoder with two exported passes: an unconditional pass that fills self-attention history and a conditional pass that cross-attends to post hidden states and predicts Chinese characters.
+- **PhonoP2CPostModel** — a bidirectional pinyin encoder that returns hidden states and a **pinyin->Chinese possibility mask**; it does not own a cross-KV cache or produce Chinese logits.
 
 The input is therefore "Chinese context + pinyin syllables", and the output is "Chinese characters". Training is joint: both sub-models are trained end-to-end on `(prefix context, pinyin, Chinese target)` samples.
 
@@ -37,7 +37,7 @@ The input is therefore "Chinese context + pinyin syllables", and the output is "
 | `config/` | hydra configuration (model, dataset, task, system, logging, output) |
 | `vocabs/` | chinese / context / pinyin vocabularies + config.yaml |
 | `dicts/` | calibration dictionary (dict_v1.txt) for decoding |
-| `datasets/` | raw corpora (in pretrain_base) and generated datasets (pretrain_v1) |
+| `datasets/` | raw corpora (in pretrain_base) and generated datasets (pretrain_v2) |
 | `checkpoints/` | training run outputs (pre_model / post_model subdirs) |
 | `pixi.toml` | pixi environment definition (Python 3.13, CUDA 13, torch cu130) |
 | `docs/en-us/` | this documentation set (English) |
@@ -63,16 +63,16 @@ A hydra-driven joint trainer builds the two sub-models from config, computes the
 
 ### 3.3 Export & Inference department
 
-After training: `param_search.py` runs the frozen model over a validation subset, extracts per-position candidate probabilities, builds a dictionary trie, and uses Optuna to tune the Viterbi decoding priors `beta_single` / `beta_word`. `export.py` freezes and exports both sub-models to ExecuTorch `.pte` files with XNNPACK dynamic per-channel quantization and shared KV-cache semantics. `demo.py` runs the same pipeline in PyTorch (greedy, top-k, and trie-constrained Viterbi decoding).
+After training: `param_search.py` runs the frozen model over a validation subset, extracts per-position candidate probabilities, builds a dictionary trie, and uses Optuna to tune the Viterbi decoding priors `beta_single` / `beta_word`. `export.py` freezes and exports a multi-method pre program plus a post encoder to ExecuTorch `.pte` files with XNNPACK dynamic per-channel quantization. `demo.py` runs the same pipeline in PyTorch (greedy, top-k, and trie-constrained Viterbi decoding).
 
 ## 4. End-to-End Data Flow (prose)
 
 1. **Corpus acquisition** — It is recommended to store raw data in `datasets/pretrain_base`. The data processor supports data in JSONL / Parquet formats from sources such as LCCC, MMC, CLUE, Wikipedia, Zhihu-KOL, and FineWeb. For very large corpora, using `subset.py` to extract a subset is recommended.
-2. **Preprocessing** — `preprocessor.py` normalizes each text, segments it, slices samples of 16–64 characters, computes nested per-character pinyin, and writes `datasets/pretrain_v1/train` (MDS, zstd) plus `datasets/pretrain_v1/val` (HF Arrow with materialized prefix/suffix/pinyin pairs).
+2. **Preprocessing** — `preprocessor.py` normalizes each text, segments it, slices samples of 16–64 characters, computes nested per-character pinyin, and writes `datasets/pretrain_v2/train` (MDS, zstd) plus `datasets/pretrain_v2/val` (HF Arrow with materialized prefix/suffix/pinyin pairs).
 3. **Training** — `main.py` loads hydra config; `Trainer` builds the tokenizer, the possibility mask, both models, and streams MDS training batches. Each batch is transformed online (span selection, pinyin augmentation), collated into NJTs, and fed to pre -> post models. The post logits are masked by the possibility mask, the loss is computed, and both models are optimized jointly. Validation runs periodically on the Arrow val set. Checkpoints are saved per epoch as `pre_model` / `post_model` subdirectories.
 4. **Decoding calibration** — `main.py task=param_search` runs inference on a val subset, saves per-position probability candidates and a dictionary trie, then Optuna searches the best `beta_single` / `beta_word` priors for Viterbi N-best decoding.
-5. **Export** — `export.py` loads the final checkpoint, exports both models with torch.export, applies XNNPACK dynamic quantization, and writes `pre_model.pte` / `post_model.pte`.
-6. **Inference** — `demo.py` loads the checkpoint, allocates the self- and cross-attention KV caches, and decodes pinyin with greedy, top-k, or dictionary-constrained Viterbi decoding.
+5. **Export** — `export.py` loads the final checkpoint, exports the two pre methods and post encoder, applies XNNPACK dynamic quantization, and writes `pre_model.pte` / `post_model.pte`.
+6. **Inference** — `demo.py` encodes pinyin once, then runs the pre decoder's conditional pass with self-KV cache state and decodes with greedy, top-k, or dictionary-constrained Viterbi decoding.
 
 ## 5. Environment
 

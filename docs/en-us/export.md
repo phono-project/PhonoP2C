@@ -106,9 +106,9 @@ Components:
 
 ## 6. `export.py` — ExecuTorch Export
 
-**Functionality:** Exports the trained `PhonoP2CPreModel` and `PhonoP2CPostModel` to ExecuTorch `.pte` programs with XNNPACK dynamic per-channel quantization, preserving the shared cross-attention KV cache semantics between the two models.
+**Functionality:** Exports the trained `PhonoP2CPreModel` and `PhonoP2CPostModel` to ExecuTorch `.pte` programs with XNNPACK dynamic per-channel quantization. The two pre passes are emitted as named methods in one multi-method `pre_model.pte`; post hidden states and the logits mask are passed to the conditional pre method at runtime.
 
-**Usage:** `python export.py`. Config constants: `CHECKPOINT_DIR` (`./checkpoints/v1_0-base/final_model`), `MODEL_TYPE` (`torch.float32`), `SAVE_DIR` (`./export_output`).
+**Usage:** `python export.py`. Config constants: `CHECKPOINT_DIR` (`./checkpoints/v2_0-base-alpha05/final_model`), `MODEL_TYPE` (`torch.float32`), `SAVE_DIR` (`./export_output`).
 
 ### `load_model_from_checkpoint(checkpoint_dir, device)`
 - Functionality: loads both sub-models from a checkpoint directory.
@@ -116,16 +116,17 @@ Components:
 
 ### Top-level script behavior
 - Loads the models, casts them to `MODEL_TYPE`, and freezes all parameters (`requires_grad = False`).
-- Derives cache geometry from the configs: pre self-attention cache `(mhsa_layers, 2, B, pre_max, pre_nheads, pre_head_dim)`, shared cross-attention cache `(2, B, pre_max, post_nheads, post_head_dim)`.
-- Builds dummy inputs and example kwargs for both models with the batched (cache) paths; `pre_example_kwargs` includes the shared `pre_cross_kv_cache` and `pre_cross_cache_pos` so the pre model writes the cross cache in place and returns it; `post_example_kwargs` reads it with `current_seqlen` = total pre-encoded prefix length.
+- Derives cache geometry from the configs: self-attention cache `(mhsa_layers, 2, B, pre_max, pre_nheads, pre_head_dim)`.
+- Builds dummy inputs for the causal pre pass, conditional pre pass, and post encoder. The conditional pass receives post hidden states and a logits-mask row; no cross-KV cache is allocated.
 - Declares dynamic dimensions: `new_prefix_len` (1..pre_max) for the pre input ids, `post_len` (1..post_cfg.pre_max_seqlen) for the post input ids.
 - Exports both models with `torch.export.export` (dynamic shapes) and prints the graphs.
 - Quantizes with `XNNPACKQuantizer` + `get_symmetric_quantization_config(is_per_channel=True, is_dynamic=True)` via torchao's `prepare_pt2e` / `convert_pt2e`, running a dummy forward (`no_grad`) between prepare and convert to calibrate; re-exports the quantized models.
-- Lowers with `to_edge_transform_and_lower` using the `XnnpackPartitioner`, builds ExecuTorch programs with `MemoryPlanningPass(alloc_graph_input=False)`, and writes `pre_model.pte` / `post_model.pte` under `SAVE_DIR`.
+- Quantizes both pre-model graphs, lowers each method independently with `XnnpackPartitioner(per_op_mode=True)`, then composes the edge methods and writes them together as `pre_model.pte`; this avoids the dependency-cycle bug in ExecuTorch 1.4.1 while allowing shared constants. The post graph is written separately as `post_model.pte`.
+- Builds ExecuTorch programs with `MemoryPlanningPass(alloc_graph_input=False)`.
 
 ## 7. `demo.py` — Inference Demo
 
-**Functionality:** Runs the trained pipeline in PyTorch with KV caches: greedy decoding, per-position top-k output, and dictionary-constrained Viterbi N-best decoding.
+**Functionality:** Runs the trained pipeline in PyTorch with a self-attention KV cache: greedy decoding, per-position top-k output, and dictionary-constrained Viterbi N-best decoding.
 
 **Usage:** `python demo.py` runs a hardcoded example (prefix "这难道不会变得很" + pinyin "luan ma"). The module functions are importable for interactive use.
 
@@ -136,20 +137,17 @@ Components:
 - Functionality: same loader as `export.py`.
 - Behavior: loads `pre_model/` and `post_model/` from the checkpoint directory, eval mode.
 
-### `create_kv_caches(pre_model, post_model, device, batch_size=1, dtype=torch.float32)`
-- Functionality: allocates the inference KV caches.
-- Behavior: pre self-attention cache shaped `(pre_num_layers, 2, B, pre_max, pre_nheads, pre_head_dim)`; shared cross-attention cache shaped `(2, B, pre_max, post_nheads, post_head_dim)` (dimensions taken from the first layers of each model); returns `(pre_kv_cache, pre_cross_kv_cache)`.
+### `create_pre_kv_cache(pre_model, batch_size=1, device=device, dtype=torch.float32)`
+- Functionality: allocates the inference self-attention KV cache.
+- Behavior: allocates `(pre_num_layers, 2, B, pre_max, pre_nheads, pre_head_dim)` and no cross-attention cache. The `beam_search` helper owns the cache for one call.
 
-### `predict_step(text, pinyin_list, pre_model, post_model, tokenizer, device, pre_kv_cache=None, pre_cross_kv_cache=None, current_seqlen=0, topk=1)`
-- Functionality: one inference step with KV caches.
-- Behavior: encodes the BOS token and runs the pre model to seed the caches (self-attention KV plus cross cache write); encodes the prefix text (`encode_context`) and runs the pre model again from `current_seqlen`, updating both caches; when the text is empty the BOS is re-encoded with cross-cache position 0 and `current_seqlen` is reset to 1; encodes the pinyin (`encode_pinyin`) and runs the post model with `pre_cross_kv_cache` and `current_seqlen` = total pre-context length; returns per `topk`:
-- `topk == 0` — `full_logits` and the new `current_seqlen`;
-- `topk == 1` — argmax ids, decoded string via `ids_to_text`, and `current_seqlen`;
-- `topk > 1` — per-position top-k ids/chars, probabilities, logits, and per-position entropy, plus `current_seqlen`.
+### `beam_search(pre_model, post_model, prefix_ids, pinyin_ids, beam_width=1, device=device, dtype=dtype, return_candidates=False)`
+- Functionality: encodes pinyin once and performs autoregressive Chinese-vocabulary beam search.
+- Behavior: pre-fills the causal prefix, runs the conditional decoder one token at a time, expands/prunes beams, and reorders the B-wide self-KV cache by parent beam. It returns scores and Chinese ids, optionally with per-position candidate distributions.
 
-### `predict_step_viterbi(text, pinyin_list, pre_model, post_model, tokenizer, device, pre_kv_cache=None, pre_cross_kv_cache=None, current_seqlen=0, beta_single=BETA_SINGLE, beta_word=BETA_WORD, trie_path=TRIE_PATH, epsilon=EPSILON, n_best=N_BEST)`
-- Functionality: inference step with dictionary-constrained Viterbi N-best decoding.
-- Behavior: calls `predict_step(topk=0)`; converts full logits to probabilities; builds per-position candidate dicts from probabilities above `epsilon` (characters resolved via the tokenizer id->char map); loads the trie (cached in `_trie_cache`); precomputes `find_matching_words` per position; runs `viterbi_nbest`; returns `{nbest: [{score, words, text}], current_seqlen, candidates}`.
+### `predict_step(text, pinyin_list, pre_model, post_model, tokenizer, device, topk=1)`
+- Functionality: public PyTorch demo wrapper for greedy or top-k generation.
+- Behavior: tokenizes context and pinyin, calls `beam_search`, and returns decoded text or N-best beams. It uses self-KV state only; cross-KV state is not part of the v2 interface.
 
 ### `_load_trie_cached(path)`
 - Functionality: lazily loads and caches the trie in a module global.

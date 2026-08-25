@@ -106,9 +106,9 @@
 
 ## 6. `export.py` — ExecuTorch 导出
 
-**功能：** 把训练好的 `PhonoP2CPreModel` 与 `PhonoP2CPostModel` 导出为带 XNNPACK 动态逐通道量化的 ExecuTorch `.pte` 程序，并保留两个模型之间共享 交叉注意力 KV Cache 的语义。
+**功能：** 把训练好的 `PhonoP2CPreModel` 与 `PhonoP2CPostModel` 导出为带 XNNPACK 动态逐通道量化的 ExecuTorch `.pte` 程序。两个 pre pass 作为命名方法写入同一个多方法 `pre_model.pte`；post hidden states 与 logits mask 在运行时传给 pre 条件方法。
 
-**用法：** `python export.py`。配置常量：`CHECKPOINT_DIR` （`./checkpoints/v1_0-base/final_model`）、`MODEL_TYPE` （`torch.float32`）、`SAVE_DIR`（`./export_output`）。
+**用法：** `python export.py`。配置常量：`CHECKPOINT_DIR` （`./checkpoints/v2_0-base-alpha05/final_model`）、`MODEL_TYPE` （`torch.float32`）、`SAVE_DIR`（`./export_output`）。
 
 ### `load_model_from_checkpoint(checkpoint_dir, device)`
 - 功能：从 checkpoint 目录加载两个子模型。
@@ -116,16 +116,17 @@
 
 ### 顶层脚本行为
 - 加载模型，转成 `MODEL_TYPE`，冻结全部参数（`requires_grad = False`）。
-- 从配置推导缓存几何：pre 自注意力缓存 `(mhsa_layers, 2, B, pre_max, pre_nheads, pre_head_dim)`，共享交叉注意力 缓存 `(2, B, pre_max, post_nheads, post_head_dim)`。
-- 为两个模型构建走批处理（缓存）路径的 dummy 输入与示例 kwargs； `pre_example_kwargs` 包含共享的 `pre_cross_kv_cache` 与 `pre_cross_cache_pos`，使 pre 模型就地写入交叉缓存并返回它； `post_example_kwargs` 以 `current_seqlen`（pre 已编码前缀总长度）读取它。
+- 从配置推导 self-attention 缓存几何 `(mhsa_layers, 2, B, pre_max, pre_nheads, pre_head_dim)`。
+- 为 causal pre pass、conditional pre pass 与 post encoder 构建 dummy 输入。条件 pass 接收 post hidden states 和一行 logits mask；不分配 cross-KV Cache。
 - 声明动态维度：`new_prefix_len`（1..pre_max）用于 pre 输入 id， `post_len`（1..post_cfg.pre_max_seqlen）用于 post 输入 id。
 - 用 `torch.export.export`（动态形状）导出两个模型并打印计算图。
 - 经 `XNNPACKQuantizer` + `get_symmetric_quantization_config( is_per_channel=True, is_dynamic=True)`，用 torchao 的 `prepare_pt2e` / `convert_pt2e` 量化，中间在 `no_grad` 下跑一次 dummy forward 做校准； 再导出量化后的模型。
-- 用 `to_edge_transform_and_lower`（`XnnpackPartitioner`）lower，以 `MemoryPlanningPass(alloc_graph_input=False)` 构建 ExecuTorch 程序，在 `SAVE_DIR` 下写出 `pre_model.pte` / `post_model.pte`。
+- 将两个 pre 图量化后分别用 `XnnpackPartitioner(per_op_mode=True)` lower，再组合 edge 方法并合并写出 `pre_model.pte`；这样可避开 ExecuTorch 1.4.1 的 dependency-cycle 问题，同时共享常量；post 图单独写出为 `post_model.pte`。
+- 用 `MemoryPlanningPass(alloc_graph_input=False)` 构建 ExecuTorch 程序。
 
 ## 7. `demo.py` — 推理演示
 
-**功能：** 在 PyTorch 中用 KV Cache 运行训练好的流水线：greedy 解码、逐 位置 top-k 输出、词典约束的 Viterbi N-best 解码。
+**功能：** 在 PyTorch 中用 self-attention KV Cache 运行训练好的流水线：greedy 解码、逐位置 top-k 输出、词典约束的 Viterbi N-best 解码。
 
 **用法：** `python demo.py` 运行内置示例（前缀 "这难道不会变得很" + 拼音 "luan ma"）。模块函数也可导入用于交互使用。
 
@@ -136,9 +137,9 @@
 - 功能：与 `export.py` 相同的加载器。
 - 行为：从 checkpoint 目录加载 `pre_model/` 与 `post_model/`，eval 模式。
 
-### `create_kv_caches(pre_model, post_model, device, batch_size=1, dtype=torch.float32)`
-- 功能：分配推理用 KV Cache。
-- 行为：pre 自注意力缓存形状 `(pre_num_layers, 2, B, pre_max, pre_nheads, pre_head_dim)`；共享交叉注意 力缓存形状 `(2, B, pre_max, post_nheads, post_head_dim)`（维度取自两个 模型的第一层）；返回 `(pre_kv_cache, pre_cross_kv_cache)`。
+### `create_pre_kv_cache(pre_model, batch_size=1, device=device, dtype=torch.float32)`
+- 功能：分配推理用 self-attention KV Cache。
+- 行为：分配 `(pre_num_layers, 2, B, pre_max, pre_nheads, pre_head_dim)`，不分配 cross-KV；`beam_search` 负责一次调用中的 cache 生命周期。
 
 ### `predict_step(text, pinyin_list, pre_model, post_model, tokenizer, device, pre_kv_cache=None, pre_cross_kv_cache=None, current_seqlen=0, topk=1)`
 - 功能：带 KV Cache 的一次推理步骤。

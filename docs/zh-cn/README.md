@@ -4,8 +4,8 @@
 
 PhonoP2C（Fast Pinyin-to-Chinese）是 PhonoP2C-collection 下的一个研究子项目，实现了一个基于两段式 "PostfixLM" 架构的**拼音转汉字（P2C）模型**：
 
-- **PhonoP2CPreModel** — 因果编码器（从左到右），读取用户已输入的中文上下文前缀（以及标点等非中文字符），输出一组共享的 K/V 投影，供后段模型使用。
-- **PhonoP2CPostModel** — 双向解码器，读取用户输入的拼音音节，对前段模型的上下文表示做交叉注意力，预测对应的汉字。候选汉字由一张**拼音->汉字可能性掩码**限定，最终结果还可以通过**词典约束的 Viterbi N-best 解码**进一步精化。
+- **PhonoP2CPreModel** — 带两个导出 pass 的因果解码器：无条件 pass 填充 self-attention 历史，条件 pass 对 post hidden states 做交叉注意力并预测汉字。
+- **PhonoP2CPostModel** — 双向拼音编码器，返回 hidden states 与**拼音->汉字可能性掩码**；不维护 cross-KV，也不直接输出汉字 logits。
 
 因此输入是"中文上下文 + 拼音音节"，输出是"汉字"。两个子模型在 `(上下文前缀, 拼音, 汉字目标)` 样本上端到端联合训练。
 
@@ -37,7 +37,7 @@ PhonoP2C（Fast Pinyin-to-Chinese）是 PhonoP2C-collection 下的一个研究�
 | `config/` | hydra 配置（model、dataset、task、system、logging、output） |
 | `vocabs/` | chinese / context / pinyin 词表及 config.yaml |
 | `dicts/` | 解码用校准词典（dict_v1.txt 来源于 jieba） |
-| `datasets/` | 原始语料（位于 pretrain_base）与生成的数据集（pretrain_v1） |
+| `datasets/` | 原始语料（位于 pretrain_base）与生成的数据集（pretrain_v2） |
 | `checkpoints/` | 训练输出（pre_model / post_model 子目录） |
 | `pixi.toml` | pixi 环境定义（Python 3.13、CUDA 13、torch cu130） |
 | `docs/zh-cn/` | 本文档集（中文） |
@@ -63,16 +63,16 @@ hydra 驱动的联合训练器：根据配置构建两个子模型，由分词�
 
 ### 3.3 导出与推理部门
 
-训练完成后：`param_search.py` 用冻结模型跑验证集子集，抽取每个位置的候选概率，构建词典 Trie，并用 Optuna 搜索 Viterbi 解码先验`beta_single` / `beta_word`；`export.py` 冻结并导出两个子模型为 ExecuTorch`.pte` 文件，采用 XNNPACK 动态逐通道量化并保留共享交叉注意力 KV Cache 语义；`demo.py` 在 PyTorch 中运行同样的流水线（greedy、top-k、以及词典约束的 Viterbi 解码）。
+训练完成后：`param_search.py` 用冻结模型跑验证集子集，抽取每个位置的候选概率，构建词典 Trie，并用 Optuna 搜索 Viterbi 解码先验`beta_single` / `beta_word`；`export.py` 冻结并导出包含两个 pre 方法的多方法程序和 post 编码器为 ExecuTorch`.pte` 文件，采用 XNNPACK 动态逐通道量化；`demo.py` 在 PyTorch 中运行同样的流水线（greedy、top-k、以及词典约束的 Viterbi 解码）。
 
 ## 4. 端到端数据流（文字描述）
 
 1. **语料获取** — 原始数据建议存放于 `datasets/pretrain_base`，数据处理器支持 LCCC、MMC、CLUE、wikipedia、zhihu-kol、fineweb 等 JSONL、Parquet 格式的数据。超大语料可先用 `subset.py` 抽取子集。
-2. **预处理** — `preprocessor.py` 规范化每条文本，分段，切成 16–64 字符的样本，计算嵌套的逐字拼音，输出 `datasets/pretrain_v1/train`（MDS，默认zstd压缩）和 `datasets/pretrain_v1/val`（HF Arrow，物化 prefix/suffix/pinyin 对）。
+2. **预处理** — `preprocessor.py` 规范化每条文本，分段，切成 16–64 字符的样本，计算嵌套的逐字拼音，输出 `datasets/pretrain_v2/train`（MDS，默认zstd压缩）和 `datasets/pretrain_v2/val`（HF Arrow，物化 prefix/suffix/pinyin 对）。
 3. **训练** — `main.py` 加载 hydra 配置；`Trainer` 构建分词器、可能性掩码、两个模型，并流式读取 MDS 训练批次。每个批次在线变换（片段选择、拼音增强）后 collate 为 NJT，送入 pre -> post 模型。post 模型的 logits 被可能性掩码过滤后计算损失，两个模型联合优化。验证集为 Arrow 格式，周期性验证。每轮保存 `pre_model` / `post_model` checkpoint。
 4. **解码校准** — `main.py task=param_search` 在验证集子集上推理，保存每个位置的概率候选与词典 Trie，再由 Optuna 搜索 Viterbi N-best 解码的最优 `beta_single` / `beta_word`。
-5. **导出** — `export.py` 加载最终 checkpoint，用 torch.export 导出两个模型，应用 XNNPACK 动态量化，写出 `pre_model.pte` / `post_model.pte`。
-6. **推理** — `demo.py` 加载 checkpoint，分配自注意力与交叉注意力 KV Cache，用 greedy、top-k 或词典约束的 Viterbi 解码完成拼音转汉字。
+5. **导出** — `export.py` 加载最终 checkpoint，导出两个 pre 方法和 post 编码器，应用 XNNPACK 动态量化，写出 `pre_model.pte` / `post_model.pte`。
+6. **推理** — `demo.py` 编码拼音一次，再使用带 self-KV Cache 的 pre 条件 pass，用 greedy、top-k 或词典约束的 Viterbi 解码完成拼音转汉字。
 
 ## 5. 运行环境
 
