@@ -27,7 +27,7 @@ MODEL_TYPE = torch.float32
 SAVE_DIR = "./export_output"
 MODEL_VERSION = "v2_0-base-alpha05"
 MODEL_FORMAT_VERSION = 2
-MAX_BATCH_SIZE = 16
+BEAM_SIZE = 3
 
 # Where the per-model + merged ExecuTorch selective-build manifests are written
 # after export. ExecuTorch's own gen_oplist can only derive an operator list
@@ -234,8 +234,6 @@ if __name__ == "__main__":
     for param in post_model.parameters():
         param.requires_grad = False
 
-    BATCH_SIZE = 3  # Representative shape; the exported batch dimension is dynamic.
-
     pre_cfg = pre_model.config
     post_cfg = post_model.config
 
@@ -243,8 +241,13 @@ if __name__ == "__main__":
     # (num_layers, 2, B, pre_max, nheads, head_dim)
     pre_self_nheads = pre_cfg.mhsa_heads
     pre_self_head_dim = pre_cfg.attn_dim // pre_cfg.mhsa_heads
-    dummy_pre_kv_cache = torch.zeros(
-        (pre_cfg.mhsa_layers, 2, BATCH_SIZE, pre_cfg.max_seqlen, pre_self_nheads, pre_self_head_dim),
+    dummy_pre1_kv_cache = torch.zeros(
+        (pre_cfg.mhsa_layers, 2, 1, pre_cfg.max_seqlen, pre_self_nheads, pre_self_head_dim),
+        device=device,
+        dtype=MODEL_TYPE,
+    )
+    dummy_pre2_kv_cache = torch.zeros(
+        (pre_cfg.mhsa_layers, 2, BEAM_SIZE, pre_cfg.max_seqlen, pre_self_nheads, pre_self_head_dim),
         device=device,
         dtype=MODEL_TYPE,
     )
@@ -253,25 +256,29 @@ if __name__ == "__main__":
     dummy_current_seqlen = 8  # tokens already resident in the caches
     dummy_post_len = 4
 
-    dummy_pre_input_ids = torch.randint(
-        low=0, high=pre_cfg.vocab_size, size=(BATCH_SIZE, dummy_new_prefix_len), dtype=torch.long
+    dummy_pre1_input_ids = torch.randint(
+        low=0, high=pre_cfg.vocab_size, size=(1, dummy_new_prefix_len), dtype=torch.long
+    )
+    dummy_pre2_input_ids = torch.randint(
+        low=0, high=pre_cfg.vocab_size, size=(BEAM_SIZE, 1), dtype=torch.long
     )
     dummy_pre_cache_pos = torch.tensor([dummy_current_seqlen], dtype=torch.long, device=device)
 
     # ---------------------------------------------------------------- pre pass 1
     pre1_example_kwargs = {
-        "input_ids": dummy_pre_input_ids,
-        "kv_cache_memory": dummy_pre_kv_cache,
+        "input_ids": dummy_pre1_input_ids,
+        "kv_cache_memory": dummy_pre1_kv_cache,
         "current_seqlen": dummy_pre_cache_pos,
         "use_custom_ops": True,
+        "return_logits": False,
     }
     new_len_dim = Dim("new_prefix_len", min=1, max=pre_cfg.max_seqlen)
-    pre1_batch_dim = Dim("pre1_batch_size", min=1, max=MAX_BATCH_SIZE)
     pre1_dynamic_shapes = {
-        "input_ids": {0: pre1_batch_dim, 1: new_len_dim},
-        "kv_cache_memory": {2: pre1_batch_dim},
+        "input_ids": {1: new_len_dim},
+        "kv_cache_memory": None,
         "current_seqlen": None,
         "use_custom_ops": None,
+        "return_logits": None,
     }
     exported_pre1 = torch.export.export(
         pre_model,
@@ -283,12 +290,11 @@ if __name__ == "__main__":
 
     # ---------------------------------------------------------------- post model
     dummy_post_input_ids = torch.randint(
-        low=0, high=post_cfg.vocab_size, size=(BATCH_SIZE, dummy_post_len), dtype=torch.long
+        low=0, high=post_cfg.vocab_size, size=(1, dummy_post_len), dtype=torch.long
     )
     post_example_kwargs = {"input_ids": dummy_post_input_ids}
     post_len_dim = Dim("post_len", min=1, max=post_cfg.max_seqlen)
-    post_batch_dim = Dim("post_batch_size", min=1, max=MAX_BATCH_SIZE)
-    post_dynamic_shapes = {"input_ids": {0: post_batch_dim, 1: post_len_dim}}
+    post_dynamic_shapes = {"input_ids": {1: post_len_dim}}
     exported_post = torch.export.export(
         post_model,
         args=(),
@@ -299,19 +305,19 @@ if __name__ == "__main__":
 
     # ---------------------------------------------------------------- pre pass 2
     dummy_post_hidden = torch.zeros(
-        (BATCH_SIZE, dummy_post_len, post_cfg.model_dim), device=device, dtype=MODEL_TYPE
+        (BEAM_SIZE, dummy_post_len, post_cfg.model_dim), device=device, dtype=MODEL_TYPE
     )
     # The logits mask is aligned 1:1 with the current decode chunk.
     dummy_logits_mask = torch.ones(
-        (BATCH_SIZE, dummy_new_prefix_len, pre_cfg.proj_size), dtype=torch.bool
+        (BEAM_SIZE, 1, pre_cfg.proj_size), dtype=torch.bool
     )
     # Local cross-attn positions: pinyin key offset 1, query step = chunk start.
     dummy_post_position_offset = torch.tensor(1, dtype=torch.long, device=device)
     dummy_cross_q_pos_start = torch.tensor(0, dtype=torch.long, device=device)
 
     pre2_example_kwargs = {
-        "input_ids": dummy_pre_input_ids,
-        "kv_cache_memory": dummy_pre_kv_cache,
+        "input_ids": dummy_pre2_input_ids,
+        "kv_cache_memory": dummy_pre2_kv_cache,
         "current_seqlen": dummy_pre_cache_pos,
         "post_hidden": dummy_post_hidden,
         "post_position_offset": dummy_post_position_offset,
@@ -319,19 +325,16 @@ if __name__ == "__main__":
         "logits_mask": dummy_logits_mask,
         "use_custom_ops": True,
     }
-    chunk_len_dim = Dim("chunk_len", min=1, max=pre_cfg.max_seqlen)
-    pre2_batch_dim = Dim("pre2_batch_size", min=1, max=MAX_BATCH_SIZE)
     pre2_dynamic_shapes = {
-        "input_ids": {0: pre2_batch_dim, 1: chunk_len_dim},
-        "kv_cache_memory": {2: pre2_batch_dim},
+        "input_ids": None,
+        "kv_cache_memory": None,
         "current_seqlen": None,
         "post_hidden": {
-            0: pre2_batch_dim,
             1: Dim("post_len2", min=1, max=post_cfg.max_seqlen),
         },
         "post_position_offset": None,
         "cross_q_pos_start": None,
-        "logits_mask": {0: pre2_batch_dim, 1: chunk_len_dim},
+        "logits_mask": None,
         "use_custom_ops": None,
     }
     exported_pre2 = torch.export.export(
@@ -342,9 +345,10 @@ if __name__ == "__main__":
         strict=True,
     ).module()
 
-    exported_pre1.print_readable()
-    exported_pre2.print_readable()
-    exported_post.print_readable()
+    if os.environ.get("PHONOP2C_EXPORT_PRINT_GRAPHS"):
+        exported_pre1.print_readable()
+        exported_pre2.print_readable()
+        exported_post.print_readable()
 
     os.makedirs(SAVE_DIR, exist_ok=True)
 

@@ -312,6 +312,30 @@ def test_kv_cache_standard_equals_custom_op(tiny_models):
     assert torch.allclose(logits_std, logits_op, atol=1e-6)
 
 
+def test_batched_prefill_can_skip_logits(tiny_models):
+    pre, _, pre_cfg, _ = tiny_models
+    cache = torch.zeros((pre_cfg.mhsa_layers, 2, 1, pre_cfg.max_seqlen,
+                         pre_cfg.mhsa_heads, pre_cfg.attn_dim // pre_cfg.mhsa_heads))
+    input_ids = torch.tensor([[1, 5, 7]], dtype=torch.long)
+
+    def reject_projection(*_args):
+        raise AssertionError("prefill must not execute lm_proj")
+
+    hook = pre.lm_proj.register_forward_hook(reject_projection)
+    try:
+        updated = pre(
+            input_ids,
+            kv_cache_memory=cache,
+            current_seqlen=torch.zeros(1, dtype=torch.long),
+            return_logits=False,
+        )
+    finally:
+        hook.remove()
+
+    assert updated.shape == cache.shape
+    assert torch.count_nonzero(updated[:, :, :, :input_ids.shape[1]]) > 0
+
+
 def test_export_with_custom_ops(tiny_models):
     from torch.export import Dim
 

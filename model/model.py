@@ -160,7 +160,8 @@ class PhonoP2CPreModel(PreTrainedModel):
                 post_hidden=None, logits_mask=None,
                 post_position_offset=None,
                 cross_q_pos_start=None,
-                use_custom_ops=False):
+                use_custom_ops=False,
+                return_logits=True):
         """Decoder forward.
 
         NJT path (``offsets`` given):
@@ -299,6 +300,12 @@ class PhonoP2CPreModel(PreTrainedModel):
                 hidden = layer["norm3"](hidden)
                 hidden = layer["ffn"](hidden)
                 hidden = hidden + residual
+
+            # Exported pass 1 only mutates and returns the cache.  Stop before
+            # the final normalization and vocabulary projection so prefill does
+            # not materialize logits that the runtime discards.
+            if using_cache and not using_cross and not return_logits:
+                return kv_cache_memory
 
             hidden = self.final_norm(hidden)
             logits = self.lm_proj(hidden)
