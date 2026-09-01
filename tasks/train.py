@@ -179,8 +179,14 @@ class Trainer:
             label_smoothing_epsilon=cfg.task.get("label_smoothing_epsilon", None),
         )
 
+        # Weight of the unconditional loss in the total loss.  A value of 0.0
+        # disables it entirely (skipping its computation and wandb logging).
+        self.unconditional_loss_lambda = cfg.task.get("unconditional_loss_lambda", 1.0)
+
         # Two-pass training wrapper
-        self.model = PhonoP2CTrainWrapper(self.pre_model, self.post_model, self.loss_fn)
+        self.model = PhonoP2CTrainWrapper(
+            self.pre_model, self.post_model, self.loss_fn, self.unconditional_loss_lambda
+        )
 
         # Compile the wrapped forward pass
         if cfg.task.compile_model:
@@ -434,7 +440,8 @@ class Trainer:
                         self._forward_batch(batch)
 
                 val_loss_sum += out.loss.item()
-                val_uncond_loss_sum += out.unconditional_loss.item()
+                if out.unconditional_loss is not None:
+                    val_uncond_loss_sum += out.unconditional_loss.item()
                 val_cond_loss_sum += out.conditional_loss.item()
                 val_steps += 1
 
@@ -488,9 +495,8 @@ class Trainer:
         topk_s_acc = beam_acc.compute()
 
         if self.log_cfg.log_with_wandb:
-            wandb.log({
+            log_data = {
                 "val/loss": avg_val_loss,
-                "val/unconditional_loss": avg_uncond_loss,
                 "val/conditional_loss": avg_cond_loss,
                 "val/ACC": m["acc"],
                 "val/Top3-ACC": m["top3_acc"],
@@ -498,7 +504,10 @@ class Trainer:
                 "val/S-ACC": m["s_acc"],
                 f"val/S-ACC@{self.beam_width}-beam": topk_s_acc,
                 "val/ECE": m["ece"],
-            }, step=global_step)
+            }
+            if self.unconditional_loss_lambda != 0.0:
+                log_data["val/unconditional_loss"] = avg_uncond_loss
+            wandb.log(log_data, step=global_step)
 
         return avg_val_loss, m
 
@@ -551,11 +560,12 @@ class Trainer:
                     if self.log_cfg.log_with_wandb:
                         log_data = {
                             "train/loss": scalar_loss,
-                            "train/unconditional_loss": out.unconditional_loss.item(),
                             "train/conditional_loss": out.conditional_loss.item(),
                             "train/adamw_lr": self.optim.param_groups[0]["lr"],
                             "train/grad_norm": norm.item()
                         }
+                        if self.unconditional_loss_lambda != 0.0:
+                            log_data["train/unconditional_loss"] = out.unconditional_loss.item()
                         wandb.log(log_data, step=global_step)
 
                     # Validation

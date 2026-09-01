@@ -25,7 +25,7 @@ class TrainOutput(NamedTuple):
     """
 
     loss: torch.Tensor
-    unconditional_loss: torch.Tensor
+    unconditional_loss: torch.Tensor | None
     conditional_loss: torch.Tensor
     conditional_logits: torch.Tensor
 
@@ -43,11 +43,12 @@ class PhonoP2CTrainWrapper(nn.Module):
     wrapper; the pre and post models stay individually saveable.
     """
 
-    def __init__(self, pre_model, post_model, loss_fn):
+    def __init__(self, pre_model, post_model, loss_fn, unconditional_loss_lambda=1.0):
         super().__init__()
         self.pre_model = pre_model
         self.post_model = post_model
         self.loss_fn = loss_fn
+        self.unconditional_loss_lambda = unconditional_loss_lambda
 
     def _loss(self, logits, targets):
         # Guard the all-ignored case (e.g. a batch of empty prefixes) that
@@ -84,8 +85,16 @@ class PhonoP2CTrainWrapper(nn.Module):
         flat_uncond = logits_uncond.values()
         flat_cond = logits_cond.values()
 
-        loss_uncond = self._loss(flat_uncond, flat_uncond_target)
+        if self.unconditional_loss_lambda == 0.0:
+            # Unconditional loss disabled: skip it entirely (and do not
+            # produce a value for logging) so only the conditional loss
+            # drives training.
+            loss_uncond = None
+        else:
+            loss_uncond = self._loss(flat_uncond, flat_uncond_target)
+
         loss_cond = self._loss(flat_cond, flat_target_ids)
-        loss = loss_uncond + loss_cond
+        loss = loss_cond if loss_uncond is None else \
+            self.unconditional_loss_lambda * loss_uncond + loss_cond
 
         return TrainOutput(loss, loss_uncond, loss_cond, flat_cond)
