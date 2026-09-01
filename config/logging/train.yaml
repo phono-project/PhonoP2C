@@ -1,9 +1,9 @@
 train:
   log_with_wandb: true
   project_name: "PhonoP2C"
-  run_name: "V2.0-Base-Alpha-04"
-  notes: "Alpha 04 uses vanilla ce loss for reference."
-  checkpoint_dir: "./checkpoints/v2_0-base-alpha04"
+  run_name: "V2.0-Small-Alpha-05"
+  notes: "Alpha 05 small model."
+  checkpoint_dir: "./checkpoints/v2_0-small-alpha05"
   histogram_interval: 10000
   val_interval: 5000
   save_interval: 1
