@@ -15,6 +15,9 @@ from torch.export import Dim
 from model.model import PhonoP2CPreModel, PhonoP2CPostModel
 
 from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner
+from executorch.exir.backend.canonical_partitioners.pattern_op_partitioner import (
+    generate_partitions_from_list_of_nodes,
+)
 from executorch.exir import EdgeProgramManager, to_edge_transform_and_lower
 from executorch.exir.capture._config import ExecutorchBackendConfig
 from executorch.exir.passes import MemoryPlanningPass
@@ -34,6 +37,27 @@ MAX_BATCH_SIZE = 16
 # the models use (see phono-core/CMakeLists.txt).
 MANIFEST_DIR = os.path.join(SAVE_DIR, "manifests")
 MANIFEST_TAG = MODEL_VERSION
+
+
+class CycleSafeXnnpackPartitioner(XnnpackPartitioner):
+    """Use FX's cycle-aware partition merger for cache-mutating graphs.
+
+    XNNPACK's grouped partitioner treats each matched configuration as an
+    indivisible group.  Dynamic-quantization dependencies can make those groups
+    span the unsupported in-place KV update, and its final getitem reassignment
+    does not revalidate the completed partition.  The result is a delegate ->
+    custom op -> same delegate dependency cycle.  The standard FX capability
+    partitioner consumes the same XNNPACK matches but refuses precisely those
+    invalid merges, preserving large valid regions without falling back to one
+    delegate per operation.
+    """
+
+    def generate_partitions(self, exported_program):
+        matched_nodes = self.get_matched_nodes_from_configs(exported_program)
+        return generate_partitions_from_list_of_nodes(
+            exported_program.graph_module,
+            pattern_list=matched_nodes,
+        )
 
 
 def load_model_from_checkpoint(checkpoint_dir: str, device: torch.device):
@@ -93,7 +117,7 @@ def lower_and_save(programs, save_path):
     for name, program in programs.items():
         single = to_edge_transform_and_lower(
             program,
-            partitioner=[XnnpackPartitioner(per_op_mode=True)],
+            partitioner=[CycleSafeXnnpackPartitioner()],
         )
         lowered_methods[name] = next(iter(single._edge_programs.values()))
     edge_program = EdgeProgramManager(lowered_methods)
