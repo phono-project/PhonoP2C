@@ -18,6 +18,8 @@ from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPar
 from executorch.exir import EdgeProgramManager, to_edge_transform_and_lower
 from executorch.exir.capture._config import ExecutorchBackendConfig
 from executorch.exir.passes import MemoryPlanningPass
+from torch.fx.passes.infra.partitioner import Partition
+from torch.fx.passes.utils.fuser_utils import validate_partition
 
 CHECKPOINT_DIR = "./checkpoints/v2_0-base-alpha05/final_model"
 MODEL_TYPE = torch.float32
@@ -25,6 +27,41 @@ SAVE_DIR = "./export_output"
 MODEL_VERSION = "v2_0-base-alpha05"
 MODEL_FORMAT_VERSION = 2
 BEAM_SIZE = 3
+
+
+class _ContiguousXnnpackPartitioner(XnnpackPartitioner):
+    """Merge adjacent config matches without GroupBasedPartitioner's cross-layer fusion."""
+
+    def generate_partitions(self, ep):
+        graph_nodes = list(ep.graph_module.graph.nodes)
+        order = {node: index for index, node in enumerate(graph_nodes)}
+        atomic = [list(part.nodes) for part in self.generate_per_op_partitions(ep)]
+        atomic.sort(
+            key=lambda nodes: min(
+                order[node] for node in nodes if node.op == "call_function"
+            )
+        )
+
+        runs = []
+        for nodes in atomic:
+            if not runs:
+                runs.append(nodes)
+                continue
+            current_compute = [node for node in runs[-1] if node.op == "call_function"]
+            next_compute = [node for node in nodes if node.op == "call_function"]
+            boundary = graph_nodes[
+                max(order[node] for node in current_compute)
+                + 1 : min(order[node] for node in next_compute)
+            ]
+            candidate = runs[-1] + nodes
+            if not any(
+                node.op == "call_function" for node in boundary
+            ) and validate_partition(candidate):
+                runs[-1] = candidate
+            else:
+                runs.append(nodes)
+        return [Partition(id=index, nodes=nodes) for index, nodes in enumerate(runs)]
+
 
 # Where the per-model + merged ExecuTorch selective-build manifests are written
 # after export. ExecuTorch's own gen_oplist can only derive an operator list
@@ -64,7 +101,9 @@ def quantize_exported(exported_module, example_kwargs, dynamic_shapes):
     )
 
     quantizer = XNNPACKQuantizer()
-    quantizer.set_global(get_symmetric_quantization_config(is_per_channel=True, is_dynamic=True))
+    quantizer.set_global(
+        get_symmetric_quantization_config(is_per_channel=True, is_dynamic=True)
+    )
 
     prepared = prepare_pt2e(exported_module, quantizer)
     # torchao dynamic quantization still needs a representative forward to
@@ -85,16 +124,15 @@ def quantize_exported(exported_module, example_kwargs, dynamic_shapes):
 
 def lower_and_save(programs, save_path):
     """Lower one or more named graphs into a single ExecuTorch program."""
-    # ExecuTorch 1.4.1 can produce an invalid cross-method XNNPACK partition
-    # for these cache-mutating graphs. Lower each method independently, then
-    # compose the edge programs before emission so the final .pte is still
-    # multi-method and can deduplicate shared constants.
+    # Lower independently before EdgeProgramManager composes the multi-method
+    # PTE, preserving shared-constant deduplication.
     lowered_methods = {}
     for name, program in programs.items():
-        # The cache-mutating pre graphs trigger an upstream grouped-partitioner
-        # dependency cycle. Keep per-op mode scoped to those methods; the post
-        # graph has no mutation and can use normal XNNPACK grouping safely.
-        partitioner = XnnpackPartitioner(per_op_mode=name.startswith("pre_model_"))
+        partitioner = (
+            _ContiguousXnnpackPartitioner()
+            if name.startswith("pre_model_")
+            else XnnpackPartitioner()
+        )
         single = to_edge_transform_and_lower(
             program,
             partitioner=[partitioner],
@@ -222,12 +260,26 @@ if __name__ == "__main__":
     pre_self_nheads = pre_cfg.mhsa_heads
     pre_self_head_dim = pre_cfg.attn_dim // pre_cfg.mhsa_heads
     dummy_pre1_kv_cache = torch.zeros(
-        (pre_cfg.mhsa_layers, 2, 1, pre_cfg.max_seqlen, pre_self_nheads, pre_self_head_dim),
+        (
+            pre_cfg.mhsa_layers,
+            2,
+            1,
+            pre_cfg.max_seqlen,
+            pre_self_nheads,
+            pre_self_head_dim,
+        ),
         device=device,
         dtype=MODEL_TYPE,
     )
     dummy_pre2_kv_cache = torch.zeros(
-        (pre_cfg.mhsa_layers, 2, BEAM_SIZE, pre_cfg.max_seqlen, pre_self_nheads, pre_self_head_dim),
+        (
+            pre_cfg.mhsa_layers,
+            2,
+            BEAM_SIZE,
+            pre_cfg.max_seqlen,
+            pre_self_nheads,
+            pre_self_head_dim,
+        ),
         device=device,
         dtype=MODEL_TYPE,
     )
@@ -242,7 +294,9 @@ if __name__ == "__main__":
     dummy_pre2_input_ids = torch.randint(
         low=0, high=pre_cfg.vocab_size, size=(BEAM_SIZE, 1), dtype=torch.long
     )
-    dummy_pre_cache_pos = torch.tensor([dummy_current_seqlen], dtype=torch.long, device=device)
+    dummy_pre_cache_pos = torch.tensor(
+        [dummy_current_seqlen], dtype=torch.long, device=device
+    )
 
     # ---------------------------------------------------------------- pre pass 1
     pre1_example_kwargs = {
@@ -288,9 +342,7 @@ if __name__ == "__main__":
         (BEAM_SIZE, dummy_post_len, post_cfg.model_dim), device=device, dtype=MODEL_TYPE
     )
     # The logits mask is aligned 1:1 with the current decode chunk.
-    dummy_logits_mask = torch.ones(
-        (BEAM_SIZE, 1, pre_cfg.proj_size), dtype=torch.bool
-    )
+    dummy_logits_mask = torch.ones((BEAM_SIZE, 1, pre_cfg.proj_size), dtype=torch.bool)
     # Local cross-attn positions: pinyin key offset 1, query step = chunk start.
     dummy_post_position_offset = torch.tensor(1, dtype=torch.long, device=device)
     dummy_cross_q_pos_start = torch.tensor(0, dtype=torch.long, device=device)
@@ -345,6 +397,8 @@ if __name__ == "__main__":
     quantized_post = quantize_exported(
         exported_post, post_example_kwargs, post_dynamic_shapes
     )
-    lower_and_save({"post_model": quantized_post}, os.path.join(SAVE_DIR, "post_model.pte"))
+    lower_and_save(
+        {"post_model": quantized_post}, os.path.join(SAVE_DIR, "post_model.pte")
+    )
 
     generate_ops_manifests()
