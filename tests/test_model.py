@@ -257,6 +257,13 @@ def test_post_model_njt_vs_batched(tiny_models):
     assert torch.equal(mask_flat[0:2], mask_b[0])
     assert torch.equal(mask_flat[2:4], mask_b[1])
 
+    post.enable_sparse_logits()
+    _, candidate_ids, candidate_mask = post(batched)
+    assert candidate_ids.shape[-1] == 1
+    assert candidate_ids[0, 0, 0] == 10
+    assert candidate_mask[0, 0, 0]
+    assert not candidate_mask[0, 1, 0]
+
 
 # --------------------------------------------------------------------------
 # Batched path: prefill + conditional decode
@@ -279,14 +286,28 @@ def test_batched_prefill_decode(tiny_models):
     next_tok = prefix[:, -1:].contiguous()
     mask = torch.ones(B, 1, 250, dtype=torch.bool)
     mask[:, :, 99] = False
+    dense_cache = cache1.clone()
     logits2, _ = pre(
-        next_tok, kv_cache_memory=cache1,
+        next_tok, kv_cache_memory=dense_cache,
         current_seqlen=torch.tensor([2, 2], dtype=torch.long),
         post_hidden=post_hidden, post_position_offset=3,
         logits_mask=mask,
     )
     assert logits2[0, 0, 99] == float("-inf")
     assert torch.isfinite(logits2[0, 0, 100])
+
+    candidate_ids = torch.tensor([5, 99, 100], dtype=torch.long)
+    candidate_mask = torch.tensor([True, False, True])
+    sparse_logits, _ = pre(
+        next_tok, kv_cache_memory=cache1,
+        current_seqlen=torch.tensor([2, 2], dtype=torch.long),
+        post_hidden=post_hidden, post_position_offset=3,
+        logits_candidate_ids=candidate_ids,
+        logits_candidate_mask=candidate_mask,
+    )
+    assert sparse_logits.shape == (B, 1, 3)
+    assert torch.allclose(sparse_logits[..., [0, 2]], logits2[..., [5, 100]])
+    assert sparse_logits[0, 0, 1] == float("-inf")
 
 
 # --------------------------------------------------------------------------

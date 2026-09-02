@@ -33,6 +33,7 @@ pass 2 decode reads the cache and cross-attends.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.checkpoint
 from transformers import PreTrainedModel
 
@@ -157,7 +158,8 @@ class PhonoP2CPreModel(PreTrainedModel):
                 kv_cache_memory=None, current_seqlen=None,
                 past_kv=None, prefix_lens=None,
                 min_seqlen_full=None, max_seqlen_full=None,
-                post_hidden=None, logits_mask=None,
+                post_hidden=None, logits_mask=None, logits_candidate_ids=None,
+                logits_candidate_mask=None,
                 post_position_offset=None,
                 cross_q_pos_start=None,
                 use_custom_ops=False,
@@ -236,9 +238,14 @@ class PhonoP2CPreModel(PreTrainedModel):
                     past_v_list.append(kv[1])
 
             hidden = self.final_norm(hidden)
-            flat_logits = self.lm_proj(hidden)
+            if logits_candidate_ids is None:
+                flat_logits = self.lm_proj(hidden)
+            else:
+                flat_logits = F.linear(hidden, self.lm_proj.weight[logits_candidate_ids])
 
-            if using_cross and logits_mask is not None:
+            if using_cross and logits_candidate_mask is not None:
+                flat_logits = apply_logits_mask(flat_logits, logits_candidate_mask)
+            elif using_cross and logits_mask is not None:
                 flat_logits = apply_logits_mask(flat_logits, logits_mask)
 
             logits_njt = _to_njt(flat_logits, offsets, min_seqlen, max_seqlen)
@@ -308,9 +315,14 @@ class PhonoP2CPreModel(PreTrainedModel):
                 return kv_cache_memory
 
             hidden = self.final_norm(hidden)
-            logits = self.lm_proj(hidden)
+            if logits_candidate_ids is None:
+                logits = self.lm_proj(hidden)
+            else:
+                logits = F.linear(hidden, self.lm_proj.weight[logits_candidate_ids])
 
-            if using_cross and logits_mask is not None:
+            if using_cross and logits_candidate_mask is not None:
+                logits = apply_logits_mask_batched(logits, logits_candidate_mask)
+            elif using_cross and logits_mask is not None:
                 logits = apply_logits_mask_batched(logits, logits_mask)
 
             if using_cache:
@@ -359,6 +371,11 @@ class PhonoP2CPostModel(PreTrainedModel):
         self.register_buffer(
             "logits_mask", torch.ones((config.vocab_size, config.proj_size), dtype=torch.bool)
         )
+        self.register_buffer("logits_candidate_ids", torch.zeros((1, 1), dtype=torch.long),
+                             persistent=False)
+        self.register_buffer("logits_candidate_mask", torch.ones((1, 1), dtype=torch.bool),
+                             persistent=False)
+        self.sparse_logits = False
 
         self.post_init()
 
@@ -381,6 +398,21 @@ class PhonoP2CPostModel(PreTrainedModel):
             hidden = layer["ffn"](hidden)
         hidden = hidden + residual
         return hidden
+
+    def enable_sparse_logits(self):
+        """Build fixed-width candidate rows from logits_mask for v2.1 export."""
+        counts = self.logits_mask.sum(dim=1)
+        width = max(1, int(counts.max().item()))
+        ids = torch.zeros((self.logits_mask.shape[0], width), dtype=torch.long,
+                          device=self.logits_mask.device)
+        valid = torch.zeros_like(ids, dtype=torch.bool)
+        for row in range(self.logits_mask.shape[0]):
+            selected = torch.nonzero(self.logits_mask[row], as_tuple=False).flatten()
+            ids[row, :selected.numel()] = selected
+            valid[row, :selected.numel()] = True
+        self.logits_candidate_ids = ids
+        self.logits_candidate_mask = valid
+        self.sparse_logits = True
 
     def forward(self, input_ids, input_offsets=None, min_seqlen=None, max_seqlen=None):
         """Encode a pinyin sequence; return hidden states and the logits mask.
@@ -405,8 +437,10 @@ class PhonoP2CPostModel(PreTrainedModel):
                     )
 
             hidden = self.final_norm(hidden)
-            mask = self.logits_mask[flat_ids]
-            return hidden, mask
+            if self.sparse_logits:
+                return (hidden, self.logits_candidate_ids[flat_ids],
+                        self.logits_candidate_mask[flat_ids])
+            return hidden, self.logits_mask[flat_ids]
 
         else:
             hidden = self.embed(input_ids)
@@ -423,5 +457,7 @@ class PhonoP2CPostModel(PreTrainedModel):
                 hidden = hidden + residual
 
             hidden = self.final_norm(hidden)
-            mask = self.logits_mask[input_ids]
-            return hidden, mask
+            if self.sparse_logits:
+                return (hidden, self.logits_candidate_ids[input_ids],
+                        self.logits_candidate_mask[input_ids])
+            return hidden, self.logits_mask[input_ids]
