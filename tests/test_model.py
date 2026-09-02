@@ -296,6 +296,22 @@ def test_batched_prefill_decode(tiny_models):
     assert logits2[0, 0, 99] == float("-inf")
     assert torch.isfinite(logits2[0, 0, 100])
 
+    shared_hidden = post_hidden[:1].expand(B, -1, -1)
+    direct_logits, _ = pre(
+        next_tok, kv_cache_memory=cache1.clone(),
+        current_seqlen=torch.tensor([2, 2], dtype=torch.long),
+        post_hidden=shared_hidden, post_position_offset=3,
+    )
+    cross_kv = torch.stack([
+        torch.stack(layer["mhca"].project_kv(post_hidden[:1])) for layer in pre.layers
+    ])
+    cached_logits, _ = pre(
+        next_tok, kv_cache_memory=cache1.clone(),
+        current_seqlen=torch.tensor([2, 2], dtype=torch.long),
+        cross_kv=cross_kv, post_position_offset=3,
+    )
+    assert torch.allclose(cached_logits, direct_logits, atol=1e-6)
+
     candidate_ids = torch.tensor([5, 99, 100], dtype=torch.long)
     candidate_mask = torch.tensor([True, False, True])
     sparse_logits, _ = pre(

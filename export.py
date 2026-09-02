@@ -29,6 +29,19 @@ MODEL_FORMAT_VERSION = "2.1"
 BEAM_SIZE = 3
 
 
+class _CrossKvProjector(torch.nn.Module):
+    """Expose every pre-layer MHCALayer.project_kv as one export method."""
+
+    def __init__(self, pre_model):
+        super().__init__()
+        self.layers = pre_model.layers
+
+    def forward(self, post_hidden):
+        return torch.stack(
+            [torch.stack(layer["mhca"].project_kv(post_hidden)) for layer in self.layers]
+        )
+
+
 class _ContiguousXnnpackPartitioner(XnnpackPartitioner):
     """Merge adjacent config matches without GroupBasedPartitioner's cross-layer fusion."""
 
@@ -260,6 +273,7 @@ if __name__ == "__main__":
 
     pre_cfg = pre_model.config
     post_cfg = post_model.config
+    cross_kv_projector = _CrossKvProjector(pre_model)
     post_model.enable_sparse_logits()
     candidate_width = post_model.logits_candidate_ids.shape[1]
 
@@ -347,8 +361,9 @@ if __name__ == "__main__":
 
     # ---------------------------------------------------------------- pre pass 2
     dummy_post_hidden = torch.zeros(
-        (BEAM_SIZE, dummy_post_len, post_cfg.model_dim), device=device, dtype=MODEL_TYPE
+        (1, dummy_post_len, post_cfg.model_dim), device=device, dtype=MODEL_TYPE
     )
+    dummy_cross_kv = cross_kv_projector(dummy_post_hidden)
     dummy_candidate_ids = torch.zeros(min(64, candidate_width), dtype=torch.long)
     # Local cross-attn positions: pinyin key offset 1, query step = chunk start.
     dummy_post_position_offset = torch.tensor(1, dtype=torch.long, device=device)
@@ -358,7 +373,7 @@ if __name__ == "__main__":
         "input_ids": dummy_pre2_input_ids,
         "kv_cache_memory": dummy_pre2_kv_cache,
         "current_seqlen": dummy_pre_cache_pos,
-        "post_hidden": dummy_post_hidden,
+        "cross_kv": dummy_cross_kv,
         "post_position_offset": dummy_post_position_offset,
         "cross_q_pos_start": dummy_cross_q_pos_start,
         "logits_candidate_ids": dummy_candidate_ids,
@@ -369,8 +384,8 @@ if __name__ == "__main__":
         "input_ids": None,
         "kv_cache_memory": None,
         "current_seqlen": None,
-        "post_hidden": {
-            1: Dim("post_len2", min=1, max=post_cfg.max_seqlen),
+        "cross_kv": {
+            3: Dim("cross_len", min=1, max=post_cfg.max_seqlen),
         },
         "post_position_offset": None,
         "cross_q_pos_start": None,
@@ -382,6 +397,18 @@ if __name__ == "__main__":
         args=(),
         kwargs=pre2_example_kwargs,
         dynamic_shapes=pre2_dynamic_shapes,
+        strict=True,
+    ).module()
+
+    cross_example_kwargs = {"post_hidden": dummy_post_hidden}
+    cross_dynamic_shapes = {
+        "post_hidden": {1: Dim("cross_source_len", min=1, max=post_cfg.max_seqlen)}
+    }
+    exported_cross_kv = torch.export.export(
+        cross_kv_projector,
+        args=(),
+        kwargs=cross_example_kwargs,
+        dynamic_shapes=cross_dynamic_shapes,
         strict=True,
     ).module()
 
@@ -398,6 +425,9 @@ if __name__ == "__main__":
         ),
         "pre_model_pass2": quantize_exported(
             exported_pre2, pre2_example_kwargs, pre2_dynamic_shapes
+        ),
+        "pre_model_cross_kv": quantize_exported(
+            exported_cross_kv, cross_example_kwargs, cross_dynamic_shapes
         ),
     }
     lower_and_save(quantized_pre_programs, os.path.join(SAVE_DIR, "pre_model.pte"))

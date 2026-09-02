@@ -334,6 +334,7 @@ class MHCALayer(nn.Module):
         return q_position_ids, kv_position_ids
 
     def forward(self, hidden, enc_hidden=None, offsets=None, post_offsets=None,
+                cross_kv=None,
                 q_position_ids=None, kv_position_ids=None,
                 min_seqlen_q=None, max_seqlen_q=None,
                 min_seqlen_kv=None, max_seqlen_kv=None,
@@ -401,7 +402,7 @@ class MHCALayer(nn.Module):
 
         else:   # (Batched path)
             B, S_q = hidden.shape[:2]
-            T = enc_hidden.shape[1]
+            T = cross_kv.shape[2] if cross_kv is not None else enc_hidden.shape[1]
 
             q = self.q_proj(hidden)
             q = q.view(B, S_q, self.num_heads, self.head_dim)
@@ -410,9 +411,10 @@ class MHCALayer(nn.Module):
             q_cos, q_sin = self.rotary(q_pos)
             q = apply_rotary_pos_emb(q, q_cos, q_sin)
 
-            k, v = self.kv_proj(enc_hidden).chunk(2, dim=-1)
-            k = k.view(B, T, self.num_heads, self.head_dim).contiguous()
-            v = v.view(B, T, self.num_heads, self.head_dim).contiguous()
+            if cross_kv is None:
+                k, v = self.project_kv(enc_hidden)
+            else:
+                k, v = cross_kv[0], cross_kv[1]
 
             kv_pos_ids = torch.arange(T, device=hidden.device, dtype=torch.long) + kv_pos_offset
             cos_kv, sin_kv = self.rotary(kv_pos_ids)
@@ -425,3 +427,10 @@ class MHCALayer(nn.Module):
             out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
             out = out.transpose(1, 2).reshape(B, S_q, self.mhca_attn_dim)
             return self.out_proj(out)
+
+    def project_kv(self, enc_hidden):
+        """Project encoder hidden states to pre-RoPE cross K/V."""
+        batch, length = enc_hidden.shape[:2]
+        k, v = self.kv_proj(enc_hidden).chunk(2, dim=-1)
+        shape = (batch, length, self.num_heads, self.head_dim)
+        return k.view(shape).contiguous(), v.view(shape).contiguous()

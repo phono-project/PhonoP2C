@@ -158,7 +158,7 @@ class PhonoP2CPreModel(PreTrainedModel):
                 kv_cache_memory=None, current_seqlen=None,
                 past_kv=None, prefix_lens=None,
                 min_seqlen_full=None, max_seqlen_full=None,
-                post_hidden=None, logits_mask=None, logits_candidate_ids=None,
+                post_hidden=None, cross_kv=None, logits_mask=None, logits_candidate_ids=None,
                 logits_candidate_mask=None,
                 post_position_offset=None,
                 cross_q_pos_start=None,
@@ -186,7 +186,7 @@ class PhonoP2CPreModel(PreTrainedModel):
         ``phono::update_mhsa_kv`` torch.library op (ExecuTorch export only);
         the default (False) uses standard PyTorch ops that run on any device.
         """
-        using_cross = post_hidden is not None
+        using_cross = post_hidden is not None or cross_kv is not None
         using_cache = kv_cache_memory is not None and current_seqlen is not None
 
         if using_cross and post_position_offset is None and offsets is None:
@@ -298,6 +298,7 @@ class PhonoP2CPreModel(PreTrainedModel):
                     hidden = layer["norm2"](hidden)
                     hidden = layer["mhca"](
                         hidden, enc_hidden=post_hidden,
+                        cross_kv=None if cross_kv is None else cross_kv[layer_idx],
                         q_pos_start=cross_q_start,
                         kv_pos_offset=kv_pos_offset,
                     )
