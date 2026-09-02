@@ -25,7 +25,7 @@ CHECKPOINT_DIR = "./checkpoints/v2_0-base-alpha05/final_model"
 MODEL_TYPE = torch.float32
 SAVE_DIR = "./export_output"
 MODEL_VERSION = "v2_0-base-alpha05"
-MODEL_FORMAT_VERSION = 2
+MODEL_FORMAT_VERSION = "2.1"
 BEAM_SIZE = 3
 
 
