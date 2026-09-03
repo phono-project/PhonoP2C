@@ -27,6 +27,7 @@ SAVE_DIR = "./export_output"
 MODEL_VERSION = "v2_1-base-alpha05"
 MODEL_FORMAT_VERSION = "2.1"
 BEAM_SIZE = 3
+QUANTIZATION = "w4a8"  # "w8a8", "w4a8", or "none"
 
 
 class _CrossKvProjector(torch.nn.Module):
@@ -104,8 +105,18 @@ def load_model_from_checkpoint(checkpoint_dir: str, device: torch.device):
     return pre_model, post_model
 
 
-def quantize_exported(exported_module, example_kwargs, dynamic_shapes):
-    """Quantize one exported graph and return it as an ExportedProgram."""
+def prepare_exported(exported_module, example_kwargs, dynamic_shapes):
+    """Apply QUANTIZATION and return an ExportedProgram."""
+    if QUANTIZATION == "none":
+        return torch.export.export(
+            exported_module,
+            args=(),
+            kwargs=example_kwargs,
+            dynamic_shapes=dynamic_shapes,
+        )
+    if QUANTIZATION not in {"w8a8", "w4a8"}:
+        raise ValueError(f"Unsupported QUANTIZATION: {QUANTIZATION}")
+
     from torchao.quantization.pt2e.quantize_pt2e import prepare_pt2e, convert_pt2e
 
     from executorch.backends.xnnpack.quantizer.xnnpack_quantizer import (
@@ -114,8 +125,16 @@ def quantize_exported(exported_module, example_kwargs, dynamic_shapes):
     )
 
     quantizer = XNNPACKQuantizer()
+    weight_range = {} if QUANTIZATION == "w8a8" else {
+        "weight_qmin": -8,
+        "weight_qmax": 7,
+    }
     quantizer.set_global(
-        get_symmetric_quantization_config(is_per_channel=True, is_dynamic=True)
+        get_symmetric_quantization_config(
+            is_per_channel=True,
+            is_dynamic=True,
+            **weight_range,
+        )
     )
     quantizer.set_filter_function(
         lambda node: not (
@@ -420,19 +439,19 @@ if __name__ == "__main__":
     os.makedirs(SAVE_DIR, exist_ok=True)
 
     quantized_pre_programs = {
-        "pre_model_pass1": quantize_exported(
+        "pre_model_pass1": prepare_exported(
             exported_pre1, pre1_example_kwargs, pre1_dynamic_shapes
         ),
-        "pre_model_pass2": quantize_exported(
+        "pre_model_pass2": prepare_exported(
             exported_pre2, pre2_example_kwargs, pre2_dynamic_shapes
         ),
-        "pre_model_cross_kv": quantize_exported(
+        "pre_model_cross_kv": prepare_exported(
             exported_cross_kv, cross_example_kwargs, cross_dynamic_shapes
         ),
     }
     lower_and_save(quantized_pre_programs, os.path.join(SAVE_DIR, "pre_model.pte"))
 
-    quantized_post = quantize_exported(
+    quantized_post = prepare_exported(
         exported_post, post_example_kwargs, post_dynamic_shapes
     )
     lower_and_save(
