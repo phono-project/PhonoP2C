@@ -24,9 +24,23 @@ from torch.fx.passes.utils.fuser_utils import validate_partition
 CHECKPOINT_DIR = "./checkpoints/v2_0-base-alpha05/final_model"
 MODEL_TYPE = torch.float32
 SAVE_DIR = "./export_output"
-MODEL_VERSION = "v2_0-base-alpha05"
-MODEL_FORMAT_VERSION = 2
+MODEL_VERSION = "v2_1-base-alpha05"
+MODEL_FORMAT_VERSION = "2.1"
 BEAM_SIZE = 3
+QUANTIZATION = "w4a8"  # "w8a8", "w4a8", or "none"
+
+
+class _CrossKvProjector(torch.nn.Module):
+    """Expose every pre-layer MHCALayer.project_kv as one export method."""
+
+    def __init__(self, pre_model):
+        super().__init__()
+        self.layers = pre_model.layers
+
+    def forward(self, post_hidden):
+        return torch.stack(
+            [torch.stack(layer["mhca"].project_kv(post_hidden)) for layer in self.layers]
+        )
 
 
 class _ContiguousXnnpackPartitioner(XnnpackPartitioner):
@@ -91,8 +105,18 @@ def load_model_from_checkpoint(checkpoint_dir: str, device: torch.device):
     return pre_model, post_model
 
 
-def quantize_exported(exported_module, example_kwargs, dynamic_shapes):
-    """Quantize one exported graph and return it as an ExportedProgram."""
+def prepare_exported(exported_module, example_kwargs, dynamic_shapes):
+    """Apply QUANTIZATION and return an ExportedProgram."""
+    if QUANTIZATION == "none":
+        return torch.export.export(
+            exported_module,
+            args=(),
+            kwargs=example_kwargs,
+            dynamic_shapes=dynamic_shapes,
+        )
+    if QUANTIZATION not in {"w8a8", "w4a8"}:
+        raise ValueError(f"Unsupported QUANTIZATION: {QUANTIZATION}")
+
     from torchao.quantization.pt2e.quantize_pt2e import prepare_pt2e, convert_pt2e
 
     from executorch.backends.xnnpack.quantizer.xnnpack_quantizer import (
@@ -101,8 +125,22 @@ def quantize_exported(exported_module, example_kwargs, dynamic_shapes):
     )
 
     quantizer = XNNPACKQuantizer()
+    weight_range = {} if QUANTIZATION == "w8a8" else {
+        "weight_qmin": -8,
+        "weight_qmax": 7,
+    }
     quantizer.set_global(
-        get_symmetric_quantization_config(is_per_channel=True, is_dynamic=True)
+        get_symmetric_quantization_config(
+            is_per_channel=True,
+            is_dynamic=True,
+            **weight_range,
+        )
+    )
+    quantizer.set_filter_function(
+        lambda node: not (
+            node.target == torch.ops.aten.linear.default
+            and getattr(node.args[1], "op", None) not in {"placeholder", "get_attr"}
+        )
     )
 
     prepared = prepare_pt2e(exported_module, quantizer)
@@ -254,6 +292,9 @@ if __name__ == "__main__":
 
     pre_cfg = pre_model.config
     post_cfg = post_model.config
+    cross_kv_projector = _CrossKvProjector(pre_model)
+    post_model.enable_sparse_logits()
+    candidate_width = post_model.logits_candidate_ids.shape[1]
 
     # Self-attention KV cache for pre_model:
     # (num_layers, 2, B, pre_max, nheads, head_dim)
@@ -339,10 +380,10 @@ if __name__ == "__main__":
 
     # ---------------------------------------------------------------- pre pass 2
     dummy_post_hidden = torch.zeros(
-        (BEAM_SIZE, dummy_post_len, post_cfg.model_dim), device=device, dtype=MODEL_TYPE
+        (1, dummy_post_len, post_cfg.model_dim), device=device, dtype=MODEL_TYPE
     )
-    # The logits mask is aligned 1:1 with the current decode chunk.
-    dummy_logits_mask = torch.ones((BEAM_SIZE, 1, pre_cfg.proj_size), dtype=torch.bool)
+    dummy_cross_kv = cross_kv_projector(dummy_post_hidden)
+    dummy_candidate_ids = torch.zeros(min(64, candidate_width), dtype=torch.long)
     # Local cross-attn positions: pinyin key offset 1, query step = chunk start.
     dummy_post_position_offset = torch.tensor(1, dtype=torch.long, device=device)
     dummy_cross_q_pos_start = torch.tensor(0, dtype=torch.long, device=device)
@@ -351,22 +392,23 @@ if __name__ == "__main__":
         "input_ids": dummy_pre2_input_ids,
         "kv_cache_memory": dummy_pre2_kv_cache,
         "current_seqlen": dummy_pre_cache_pos,
-        "post_hidden": dummy_post_hidden,
+        "cross_kv": dummy_cross_kv,
         "post_position_offset": dummy_post_position_offset,
         "cross_q_pos_start": dummy_cross_q_pos_start,
-        "logits_mask": dummy_logits_mask,
+        "logits_candidate_ids": dummy_candidate_ids,
         "use_custom_ops": True,
     }
+    candidate_dim = Dim("candidate_width", min=1, max=candidate_width)
     pre2_dynamic_shapes = {
         "input_ids": None,
         "kv_cache_memory": None,
         "current_seqlen": None,
-        "post_hidden": {
-            1: Dim("post_len2", min=1, max=post_cfg.max_seqlen),
+        "cross_kv": {
+            3: Dim("cross_len", min=1, max=post_cfg.max_seqlen),
         },
         "post_position_offset": None,
         "cross_q_pos_start": None,
-        "logits_mask": None,
+        "logits_candidate_ids": {0: candidate_dim},
         "use_custom_ops": None,
     }
     exported_pre2 = torch.export.export(
@@ -374,6 +416,18 @@ if __name__ == "__main__":
         args=(),
         kwargs=pre2_example_kwargs,
         dynamic_shapes=pre2_dynamic_shapes,
+        strict=True,
+    ).module()
+
+    cross_example_kwargs = {"post_hidden": dummy_post_hidden}
+    cross_dynamic_shapes = {
+        "post_hidden": {1: Dim("cross_source_len", min=1, max=post_cfg.max_seqlen)}
+    }
+    exported_cross_kv = torch.export.export(
+        cross_kv_projector,
+        args=(),
+        kwargs=cross_example_kwargs,
+        dynamic_shapes=cross_dynamic_shapes,
         strict=True,
     ).module()
 
@@ -385,16 +439,19 @@ if __name__ == "__main__":
     os.makedirs(SAVE_DIR, exist_ok=True)
 
     quantized_pre_programs = {
-        "pre_model_pass1": quantize_exported(
+        "pre_model_pass1": prepare_exported(
             exported_pre1, pre1_example_kwargs, pre1_dynamic_shapes
         ),
-        "pre_model_pass2": quantize_exported(
+        "pre_model_pass2": prepare_exported(
             exported_pre2, pre2_example_kwargs, pre2_dynamic_shapes
+        ),
+        "pre_model_cross_kv": prepare_exported(
+            exported_cross_kv, cross_example_kwargs, cross_dynamic_shapes
         ),
     }
     lower_and_save(quantized_pre_programs, os.path.join(SAVE_DIR, "pre_model.pte"))
 
-    quantized_post = quantize_exported(
+    quantized_post = prepare_exported(
         exported_post, post_example_kwargs, post_dynamic_shapes
     )
     lower_and_save(
