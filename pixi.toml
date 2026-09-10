@@ -15,16 +15,13 @@ pip = "*"
 jieba = "*"
 torch = { version = "*", index = "https://download.pytorch.org/whl/cu130" }
 torchvision = { version = "*", index = "https://download.pytorch.org/whl/cu130" }
-triton = { version = "*", index = "https://download.pytorch.org/whl/cu130" }
 torchao = { version = "*", index = "https://download.pytorch.org/whl/cu130" }
-mslk = { version = "*", index = "https://download.pytorch.org/whl/cu130" }
 executorch = "*"
 bitsandbytes = "*"
 
 pypinyin = "*"
 netcal = "*"
 optuna = "*"
-opencc = "*"
 zhconv-rs = "*"
 
 transformers = "*"
@@ -36,20 +33,19 @@ tqdm = "*"
 rich = "*"
 wandb = "*"
 hydra-core = "*"
+pyyaml = "*"
+pytest = "*"
 
 black = "*"
 isort = "*"
 flake8 = "*"
 mypy = "*"
-pre-commit = "*"
 
 
 [tasks]
-jupyter = "jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root"
 format = "black . && isort ."
 lint = "flake8 . && mypy ."
 test = "pytest"
 
 [environments]
 default = { features = [], solve-group = "default" }
-
