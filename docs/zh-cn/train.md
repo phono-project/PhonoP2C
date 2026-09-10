@@ -20,6 +20,28 @@
 
 **用法：** `python main.py`（训练，按 `config/task/train.yaml`），或 `python main.py task=param_search`（并附加任务级覆盖，见 `export.md`）。
 
+### 单机多卡 DDP
+
+训练使用原生 PyTorch DDP，由 `torchrun` 启动：
+
+```bash
+pixi run torchrun --standalone --nproc-per-node=4 main.py
+```
+
+`task.batchsize` 是每张卡的 batch size，因此全局 batch size 为
+`task.batchsize * world_size`。Mosaic `StreamingDataset` 根据 torchrun 环境变量
+自行切分训练数据，不应额外添加 `DistributedSampler`。验证集由不补齐、不重复的
+sampler 交错分片，各 rank 同时执行前向与 beam search，最后汇总 token 加权 loss、
+ACC/Top-k/S-ACC、beam sentence accuracy 和 adaptive ECE。W&B、进度条与 checkpoint
+只由 rank 0 写入。
+
+训练 loss 也按所有 rank 的全局有效 token 数加权，因此变长 NJT 批次的 DDP 梯度
+与把各 rank 样本合并成一个全局 batch 的单进程梯度具有相同的归约语义。当前使用的
+PyTorch 2.13 中，DDP 与 NJT activation checkpoint 重算组合会为同一 ragged 维度
+生成不同的符号 ID；训练器因此仅在 DDP 模式关闭 gradient checkpointing。该兼容
+处理不修改模型、attention、offsets 或 loss，只增加 activation 显存并省去重算开销；
+单进程仍保持配置指定的 checkpointing 行为。
+
 **行为。**
 
 - 设置 `WANDB_CONSOLE=off`；`system.expandable_segments_enabled` 时启用 CUDA `expandable_segments` 分配器。
