@@ -14,12 +14,14 @@ import os
 import logging
 
 import torch
+import torch.distributed as dist
 import bitsandbytes as bnb
 from transformers import get_wsd_schedule
 import wandb
 from streaming import StreamingDataLoader
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
+from torch.nn.parallel import DistributedDataParallel
 from rich.progress import (
     Progress,
     BarColumn,
@@ -45,6 +47,11 @@ from torchao.float8 import Float8LinearConfig, convert_to_float8_training
 from utils.float8 import module_filter_fn
 from loss import get_loss_fn
 from metrics import MetricsAccumulator, TopKSentenceAccuracy
+from utils.distributed import (
+    DistributedContext,
+    DistributedEvalSampler,
+    ddp_local_mean_scale,
+)
 
 from rich.progress import ProgressColumn
 from rich.text import Text
@@ -65,7 +72,7 @@ class MofNCompleteColumn(ProgressColumn):
         return Text(f"{completed}/{total}", style="grey50")
 
 
-def _build_progress(cfg: DictConfig) -> Progress:
+def _build_progress(cfg: DictConfig, disable: bool = False) -> Progress:
     pcfg = cfg.output.progress_bar
     columns = [
         TextColumn("[progress.description]{task.description}"),
@@ -92,6 +99,7 @@ def _build_progress(cfg: DictConfig) -> Progress:
         *columns,
         refresh_per_second=pcfg.get("refresh_per_second", 10),
         transient=pcfg.get("transient", True),
+        disable=disable,
     )
 
 
@@ -109,9 +117,22 @@ def build_model_configs(cfg: DictConfig, tokenizer: P2CTokenizer) -> tuple:
 
 
 class Trainer:
-    def __init__(self, cfg: DictConfig):
+    def __init__(self, cfg: DictConfig, distributed: DistributedContext | None = None):
         self.cfg = cfg
-        self.device = torch.device(cfg.system.device)
+        self.distributed = distributed or DistributedContext(
+            rank=0,
+            local_rank=0,
+            world_size=1,
+            device=torch.device(cfg.system.device),
+        )
+        self.device = self.distributed.device
+        self.is_main = self.distributed.is_main
+        if self.is_main and self.distributed.is_distributed:
+            print(
+                f"DDP enabled: world_size={self.distributed.world_size}, "
+                f"device={self.device}, per-rank batch_size={cfg.task.batchsize}, "
+                f"global batch_size={cfg.task.batchsize * self.distributed.world_size}"
+            )
 
         # Logging
         log_level = cfg.output.logging.get("log_level", "WARNING").upper()
@@ -127,10 +148,12 @@ class Trainer:
         self.pre_cfg, self.post_cfg = build_model_configs(cfg, self.tokenizer)
 
         # Build logits mask
-        print("Building pinyin->Chinese possibility map...")
+        if self.is_main:
+            print("Building pinyin->Chinese possibility map...")
         logits_mask = self.tokenizer.create_possibility_map().to(self.device)
-        print(f"  Mask: {logits_mask.shape}, nonzero={logits_mask.sum().item()} "
-              f"({100 * logits_mask.sum().item() / logits_mask.numel():.1f}%)")
+        if self.is_main:
+            print(f"  Mask: {logits_mask.shape}, nonzero={logits_mask.sum().item()} "
+                  f"({100 * logits_mask.sum().item() / logits_mask.numel():.1f}%)")
 
         # Build models
         self.pre_model = PhonoP2CPreModel(self.pre_cfg).to(self.device)
@@ -149,13 +172,15 @@ class Trainer:
             self.pre_model = PhonoP2CPreModel.from_pretrained(pre_path).to(self.device)
             self.post_model = PhonoP2CPostModel.from_pretrained(post_path).to(self.device)
             self.post_model.logits_mask = logits_mask
-            print(f"Loaded model parameters from {load_from}")
+            if self.is_main:
+                print(f"Loaded model parameters from {load_from}")
 
         total_params = (sum(p.numel() for p in self.pre_model.parameters()) +
                         sum(p.numel() for p in self.post_model.parameters()))
-        print(f"Pre model:  {sum(p.numel() for p in self.pre_model.parameters()) / 1e6:.2f}M params")
-        print(f"Post model: {sum(p.numel() for p in self.post_model.parameters()) / 1e6:.2f}M params")
-        print(f"Total:      {total_params / 1e6:.2f}M params")
+        if self.is_main:
+            print(f"Pre model:  {sum(p.numel() for p in self.pre_model.parameters()) / 1e6:.2f}M params")
+            print(f"Post model: {sum(p.numel() for p in self.post_model.parameters()) / 1e6:.2f}M params")
+            print(f"Total:      {total_params / 1e6:.2f}M params")
 
         # Float8 acceleration
         if cfg.system.ao_acceleration == 'float8':
@@ -165,9 +190,16 @@ class Trainer:
 
         # Gradient checkpointing: recompute layer activations in backward to
         # cut peak activation memory, letting a larger batchsize fill the ALUs.
-        if cfg.system.get("gradient_checkpointing", False):
+        if cfg.system.get("gradient_checkpointing", False) and not self.distributed.is_distributed:
             self.pre_model.gradient_checkpointing = True
             self.post_model.gradient_checkpointing = True
+        elif cfg.system.get("gradient_checkpointing", False) and self.is_main:
+            print(
+                "WARNING: gradient checkpointing is disabled under DDP: PyTorch 2.13 "
+                "currently gives NJT ragged dimensions different symbolic IDs "
+                "during checkpoint recomputation. This changes memory/compute "
+                "usage only; the model and loss are unchanged."
+            )
 
         # Loss function (delivered into the wrapper so the loss is computed
         # inside the compiled region for better optimization).
@@ -196,11 +228,21 @@ class Trainer:
             dynamo_config.capture_dynamic_output_shape_ops = True
             self.model = torch.compile(self.model, mode=mode, dynamic=True)
 
+        if self.distributed.is_distributed:
+            self.model = DistributedDataParallel(
+                self.model,
+                device_ids=[self.device.index],
+                output_device=self.device.index,
+                broadcast_buffers=False,
+            )
+
         # Logging
         self.log_cfg = cfg.logging.train
         self.checkpoint_dir = self.log_cfg.checkpoint_dir
-        os.makedirs(self.checkpoint_dir, exist_ok=True)
-        if self.log_cfg.log_with_wandb:
+        if self.is_main:
+            os.makedirs(self.checkpoint_dir, exist_ok=True)
+        self.distributed.barrier()
+        if self.log_cfg.log_with_wandb and self.is_main:
             wandb.init(
                 project=self.log_cfg.project_name,
                 name=self.log_cfg.run_name,
@@ -245,10 +287,15 @@ class Trainer:
         self.val_ds.set_transform(
             lambda batch: transform_pinyin_predict_val(batch, self.tokenizer, None)
         )
+        self.val_sampler = DistributedEvalSampler(
+            self.val_ds,
+            rank=self.distributed.rank,
+            world_size=self.distributed.world_size,
+        )
         self.val_loader = DataLoader(
             self.val_ds,
             batch_size=cfg.task.batchsize,
-            shuffle=False,
+            sampler=self.val_sampler,
             pin_memory=True,
             collate_fn=make_collate_fn(),
             num_workers=cfg.system.num_workers,
@@ -347,7 +394,8 @@ class Trainer:
             scheduler_path = os.path.join(load_from, "optim_state", "scheduler.pt")
             if os.path.isfile(scheduler_path):
                 self.schd.load_state_dict(torch.load(scheduler_path, map_location=self.device))
-            print(f"Loaded optimizer state from {load_from}")
+            if self.is_main:
+                print(f"Loaded optimizer state from {load_from}")
         self.use_amp = cfg.system.mixed_precision == "bf16"
 
         # Beam search metric settings
@@ -361,23 +409,24 @@ class Trainer:
         self.beam_stride = max(1, int(cfg.task.get("beam_search_stride", 4)))
 
     def _save_checkpoint(self, save_path: str) -> None:
-        pre_to_save = self.pre_model._orig_mod if hasattr(self.pre_model, "_orig_mod") else self.pre_model
-        post_to_save = self.post_model._orig_mod if hasattr(self.post_model, "_orig_mod") else self.post_model
+        if self.is_main:
+            pre_to_save = self.pre_model._orig_mod if hasattr(self.pre_model, "_orig_mod") else self.pre_model
+            post_to_save = self.post_model._orig_mod if hasattr(self.post_model, "_orig_mod") else self.post_model
 
-        pre_to_save.save_pretrained(os.path.join(save_path, "pre_model"), safe_serialization=True)
-        post_to_save.save_pretrained(os.path.join(save_path, "post_model"), safe_serialization=True)
+            pre_to_save.save_pretrained(os.path.join(save_path, "pre_model"), safe_serialization=True)
+            post_to_save.save_pretrained(os.path.join(save_path, "post_model"), safe_serialization=True)
 
-        optim_path = os.path.join(save_path, "optim_state")
-        os.makedirs(optim_path, exist_ok=True)
-        torch.save(self.optim.state_dict(), os.path.join(optim_path, "optimizer.pt"))
-        torch.save(self.schd.state_dict(), os.path.join(optim_path, "scheduler.pt"))
+            optim_path = os.path.join(save_path, "optim_state")
+            os.makedirs(optim_path, exist_ok=True)
+            torch.save(self.optim.state_dict(), os.path.join(optim_path, "optimizer.pt"))
+            torch.save(self.schd.state_dict(), os.path.join(optim_path, "scheduler.pt"))
 
-        config_path = os.path.join(save_path, "configs")
-        os.makedirs(config_path, exist_ok=True)
-        OmegaConf.save(self.cfg, os.path.join(config_path, "config.yaml"), resolve=True)
+            config_path = os.path.join(save_path, "configs")
+            os.makedirs(config_path, exist_ok=True)
+            OmegaConf.save(self.cfg, os.path.join(config_path, "config.yaml"), resolve=True)
+        self.distributed.barrier()
 
-    def _forward_batch(self, batch):
-        full_prefix_njt = batch["full_prefix_ids_njt"].to(self.device)
+    def _forward_batch(self, batch, model=None):
         prefix_njt = batch["prefix_ids_njt"].to(self.device)
         suffix_njt = batch["suffix_ids_njt"].to(self.device)
         uncond_target_njt = batch["uncond_target_ids_njt"].to(self.device)
@@ -405,76 +454,91 @@ class Trainer:
         min_sl_full = full_lens.min().item()
         max_sl_full = full_lens.max().item()
 
-        out = self.model(
+        forward_model = self.model if model is None else model
+        out = forward_model(
             flat_prefix, prefix_offsets, flat_suffix, suffix_offsets,
             flat_postfix, flat_uncond_target, flat_target_ids, prefix_lens,
             min_sl_prefix, max_sl_prefix, min_sl_suffix, max_sl_suffix,
             min_sl_full, max_sl_full,
         )
 
-        return out, flat_target_ids, suffix_offsets, full_prefix_njt, postfix_njt, target_njt
+        return out, flat_target_ids, suffix_offsets, flat_uncond_target
 
     def validate(self, model, loader, epoch, global_step, progress):
         model.eval()
         metrics_acc = MetricsAccumulator(ece_bins=self.cfg.task.ece_bins, ece_top_k=self.cfg.task.ece_top_k)
         beam_acc = TopKSentenceAccuracy(k=self.beam_width)
-        val_steps = 0
-        val_loss_sum = 0.0
-        val_uncond_loss_sum = 0.0
         val_cond_loss_sum = 0.0
+        val_cond_tokens = 0
+        val_uncond_loss_sum = 0.0
+        val_uncond_tokens = 0
 
         pre_model = self.pre_model
         post_model = self.post_model
 
-        # Collect all beam-search samples in dataset order (so strided
-        # sampling spreads evenly across sources), then group by pinyin length
-        # so each group can be decoded with a large, efficient batch.
+        # Collect only this rank's share of the global strided beam subset.
         beam_samples: list[tuple] = []
+        local_sample_index = 0
 
-        val_task = progress.add_task(f"[cyan]Validating Epoch {epoch + 1}/{self.cfg.task.epochs}", total=len(loader), postfix="")
+        val_task = progress.add_task(
+            f"[cyan]Validating Epoch {epoch + 1}/{self.cfg.task.epochs}",
+            total=len(loader),
+            postfix="",
+        )
 
         with torch.no_grad():
             for batch in loader:
                 with torch.amp.autocast(self.device.type, dtype=torch.bfloat16, enabled=self.use_amp):
-                    out, flat_target_ids, target_offsets, full_prefix_njt, postfix_njt, target_njt = \
-                        self._forward_batch(batch)
+                    out, flat_target_ids, target_offsets, flat_uncond_target = self._forward_batch(
+                        batch, model=model
+                    )
 
-                val_loss_sum += out.loss.item()
+                cond_tokens = flat_target_ids.numel()
+                val_cond_loss_sum += out.conditional_loss.item() * cond_tokens
+                val_cond_tokens += cond_tokens
                 if out.unconditional_loss is not None:
-                    val_uncond_loss_sum += out.unconditional_loss.item()
-                val_cond_loss_sum += out.conditional_loss.item()
-                val_steps += 1
+                    uncond_tokens = int((flat_uncond_target != -100).sum().item())
+                    val_uncond_loss_sum += out.unconditional_loss.item() * uncond_tokens
+                    val_uncond_tokens += uncond_tokens
 
                 # Update metrics (conditional logits are the predictions)
                 metrics_acc.update(out.conditional_logits.detach(), flat_target_ids, target_offsets)
 
-                # Collect beam-search samples.
+                # Use the CPU batch so deferred beam search does not retain
+                # every validation target (and its backing storage) in VRAM.
+                # Stride each rank's interleaved partition locally so beam
+                # work stays balanced even when stride and world size overlap.
                 for prefix_t, postfix_t, target_t in zip(
-                    full_prefix_njt.unbind(), postfix_njt.unbind(), target_njt.unbind()
+                    batch["full_prefix_ids_njt"].unbind(),
+                    batch["postfix_ids_njt"].unbind(),
+                    batch["target_ids_njt"].unbind(),
                 ):
-                    beam_samples.append((prefix_t.tolist(), postfix_t.tolist(), target_t))
+                    if local_sample_index % self.beam_stride == 0:
+                        beam_samples.append(
+                            (prefix_t.tolist(), postfix_t.tolist(), target_t.tolist())
+                        )
+                    local_sample_index += 1
 
                 progress.update(val_task, advance=1, postfix=f"[red]loss: {out.loss.item():.4f}")
 
-        # Strided sampling (even, unbiased spread) then group by pinyin length.
-        sampled = beam_samples[:: self.beam_stride]
+        # Group by pinyin length so each beam-search batch is rectangular.
         beam_groups: dict[int, list] = {}
-        for prefix, pinyin, target in sampled:
+        for prefix, pinyin, target in beam_samples:
             beam_groups.setdefault(len(pinyin), []).append((prefix, pinyin, target))
 
         # Standalone progress bar for the beam-search metric.
         beam_dtype = torch.bfloat16 if self.use_amp else None
         beam_task = progress.add_task(
             f"[cyan]S-ACC@{self.beam_width}-beam",
-            total=len(sampled),
-            postfix=f"[red]{len(sampled)} samples (1/{self.beam_stride})",
+            total=len(beam_samples),
+            postfix=f"[red]{len(beam_samples)} local samples (1/{self.beam_stride})",
         )
-        for T, group in beam_groups.items():
+        for group in beam_groups.values():
             for i in range(0, len(group), self.beam_chunk_size):
                 chunk = group[i:i + self.beam_chunk_size]
                 prefixes = [c[0] for c in chunk]
                 pinyins = [c[1] for c in chunk]
-                targets = torch.stack([c[2] for c in chunk])
+                targets = torch.tensor([c[2] for c in chunk], device=self.device)
                 with torch.amp.autocast(self.device.type, dtype=torch.bfloat16, enabled=self.use_amp):
                     _, beam_ids = beam_search_batch(
                         pre_model, post_model, prefixes, pinyins,
@@ -488,13 +552,45 @@ class Trainer:
 
         model.train()
 
-        avg_val_loss = val_loss_sum / max(val_steps, 1)
-        avg_uncond_loss = val_uncond_loss_sum / max(val_steps, 1)
-        avg_cond_loss = val_cond_loss_sum / max(val_steps, 1)
-        m = metrics_acc.compute()
-        topk_s_acc = beam_acc.compute()
+        totals = torch.tensor(
+            [
+                val_cond_loss_sum,
+                val_cond_tokens,
+                val_uncond_loss_sum,
+                val_uncond_tokens,
+                beam_acc.correct_sentences,
+                beam_acc.total_sentences,
+            ],
+            dtype=torch.float64,
+            device=self.device,
+        )
+        if self.distributed.is_distributed:
+            dist.all_reduce(totals, op=dist.ReduceOp.SUM)
 
-        if self.log_cfg.log_with_wandb:
+        avg_cond_loss = (totals[0] / totals[1].clamp_min(1)).item()
+        avg_uncond_loss = (totals[2] / totals[3].clamp_min(1)).item()
+        avg_val_loss = avg_cond_loss + self.unconditional_loss_lambda * avg_uncond_loss
+        topk_s_acc = (totals[4] / totals[5].clamp_min(1)).item()
+
+        if self.distributed.is_distributed:
+            gathered_states = [None] * self.distributed.world_size if self.is_main else None
+            dist.gather_object(
+                metrics_acc.state_dict(),
+                object_gather_list=gathered_states,
+                dst=0,
+                group=self.distributed.object_group,
+            )
+            if self.is_main:
+                metrics_acc.reset()
+                for state in gathered_states:
+                    metrics_acc.merge_state_dict(state)
+                m = metrics_acc.compute()
+            else:
+                m = {}
+        else:
+            m = metrics_acc.compute()
+
+        if self.log_cfg.log_with_wandb and self.is_main:
             log_data = {
                 "val/loss": avg_val_loss,
                 "val/conditional_loss": avg_cond_loss,
@@ -512,10 +608,12 @@ class Trainer:
         return avg_val_loss, m
 
     def train(self):
-        model = self.model
+        # Validation intentionally bypasses the DDP wrapper: rank shards can
+        # contain different batch counts, and inference needs no gradient sync.
+        model = self.model.module if self.distributed.is_distributed else self.model
         cfg = self.cfg
 
-        progress = _build_progress(cfg)
+        progress = _build_progress(cfg, disable=not self.is_main)
         global_step = 0
 
         with progress:
@@ -539,37 +637,102 @@ class Trainer:
                     self.optim.zero_grad()
 
                     with torch.amp.autocast(self.device.type, dtype=torch.bfloat16, enabled=self.use_amp):
-                        out, *_ = self._forward_batch(batch)
+                        out, flat_target_ids, _, flat_uncond_target = self._forward_batch(batch)
 
-                    out.loss.backward()
+                    # Each rank's CE/focal loss is a mean over its local tokens.
+                    # NJT batches have different token counts, so a plain DDP
+                    # average would not equal the loss of the combined global
+                    # batch. Scale each local mean such that DDP's gradient
+                    # average becomes an exact global token-weighted mean.
+                    local_token_counts = torch.tensor(
+                        [
+                            flat_target_ids.numel(),
+                            int((flat_uncond_target != -100).sum().item()),
+                        ],
+                        dtype=torch.float64,
+                        device=self.device,
+                    )
+                    global_token_counts = local_token_counts.clone()
+                    if self.distributed.is_distributed:
+                        dist.all_reduce(global_token_counts, op=dist.ReduceOp.SUM)
+
+                    if self.distributed.is_distributed:
+                        cond_scale = ddp_local_mean_scale(
+                            local_token_counts[0],
+                            global_token_counts[0],
+                            self.distributed.world_size,
+                        )
+                        loss_for_backward = out.conditional_loss * cond_scale
+                        if out.unconditional_loss is not None:
+                            uncond_scale = ddp_local_mean_scale(
+                                local_token_counts[1],
+                                global_token_counts[1],
+                                self.distributed.world_size,
+                            )
+                            loss_for_backward = loss_for_backward + (
+                                self.unconditional_loss_lambda
+                                * out.unconditional_loss
+                                * uncond_scale
+                            )
+                    else:
+                        loss_for_backward = out.loss
+
+                    loss_for_backward.backward()
 
                     if cfg.task.gradient_clip_val > 0:
                         all_params = list(self.pre_model.parameters()) + list(self.post_model.parameters())
                         norm = torch.nn.utils.clip_grad_norm_(all_params, cfg.task.gradient_clip_val)
                     else:
-                        norm = torch.tensor(0.0)
+                        norm = torch.tensor(0.0, device=self.device)
 
                     self.optim.step()
                     self.schd.step()
 
                     global_step += 1
-                    scalar_loss = out.loss.item()
+                    train_stats = torch.stack([
+                        out.conditional_loss.detach().double() * local_token_counts[0],
+                        (
+                            out.unconditional_loss.detach().double()
+                            * local_token_counts[1]
+                            if out.unconditional_loss is not None
+                            else local_token_counts.new_zeros(())
+                        ),
+                        norm.detach().double(),
+                    ])
+                    if self.distributed.is_distributed:
+                        dist.all_reduce(train_stats, op=dist.ReduceOp.SUM)
+                    conditional_loss = (
+                        train_stats[0] / global_token_counts[0].clamp_min(1)
+                    ).item()
+                    unconditional_loss = (
+                        train_stats[1] / global_token_counts[1].clamp_min(1)
+                    ).item()
+                    scalar_loss = conditional_loss + (
+                        self.unconditional_loss_lambda * unconditional_loss
+                    )
+                    grad_norm = (
+                        train_stats[2] / self.distributed.world_size
+                    ).item()
 
                     progress.update(batch_task, advance=1, postfix=f"[red]loss: {scalar_loss:.4f}")
 
-                    if self.log_cfg.log_with_wandb:
+                    if self.log_cfg.log_with_wandb and self.is_main:
                         log_data = {
                             "train/loss": scalar_loss,
-                            "train/conditional_loss": out.conditional_loss.item(),
+                            "train/conditional_loss": conditional_loss,
                             "train/adamw_lr": self.optim.param_groups[0]["lr"],
-                            "train/grad_norm": norm.item()
+                            "train/grad_norm": grad_norm,
                         }
                         if self.unconditional_loss_lambda != 0.0:
-                            log_data["train/unconditional_loss"] = out.unconditional_loss.item()
+                            log_data["train/unconditional_loss"] = unconditional_loss
                         wandb.log(log_data, step=global_step)
 
                     # Validation
-                    if (global_step % self.log_cfg.val_interval == 0) or (global_step == self.total_steps):
+                    should_validate = (
+                        global_step % self.log_cfg.val_interval == 0
+                        or global_step == self.total_steps
+                    )
+                    if should_validate:
                         avg_val_loss, _metrics = self.validate(
                             model, self.val_loader, epoch, global_step, progress
                         )
@@ -578,6 +741,9 @@ class Trainer:
                             epoch_task,
                             postfix=f"[red]val_loss={avg_val_loss:.4f}"
                         )
+
+                    if global_step >= self.total_steps:
+                        break
 
                 progress.update(
                     epoch_task,
@@ -591,8 +757,11 @@ class Trainer:
                     save_path = os.path.join(self.checkpoint_dir, f"epoch_{epoch + 1}")
                     self._save_checkpoint(save_path)
 
+                if global_step >= self.total_steps:
+                    break
+
         save_path = os.path.join(self.checkpoint_dir, "final_model")
         self._save_checkpoint(save_path)
 
-        if self.log_cfg.log_with_wandb:
+        if self.log_cfg.log_with_wandb and self.is_main:
             wandb.finish()

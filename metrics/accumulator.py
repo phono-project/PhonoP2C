@@ -139,6 +139,46 @@ class MetricsAccumulator:
             "ece": ece,
         }
 
+    def state_dict(self) -> dict:
+        """Return a CPU-only, pickleable state for cross-rank gathering."""
+        confidences = (
+            torch.cat(self._ece_confidences)
+            if self._ece_confidences
+            else torch.empty(0, dtype=torch.float64)
+        )
+        correct = (
+            torch.cat(self._ece_correct)
+            if self._ece_correct
+            else torch.empty(0, dtype=torch.float64)
+        )
+        return {
+            "ece_bins": self.ece_bins,
+            "ece_top_k": self.ece_top_k,
+            "total_tokens": self._total_tokens,
+            "correct_top1": self._correct_top1,
+            "correct_top3": self._correct_top3,
+            "correct_top5": self._correct_top5,
+            "total_sentences": self._total_sentences,
+            "correct_sentences": self._correct_sentences,
+            "ece_confidences": confidences,
+            "ece_correct": correct,
+        }
+
+    def merge_state_dict(self, state: dict) -> None:
+        """Merge one state returned by :meth:`state_dict`."""
+        if state["ece_bins"] != self.ece_bins or state["ece_top_k"] != self.ece_top_k:
+            raise ValueError("Cannot merge metric states with different ECE settings.")
+
+        self._total_tokens += state["total_tokens"]
+        self._correct_top1 += state["correct_top1"]
+        self._correct_top3 += state["correct_top3"]
+        self._correct_top5 += state["correct_top5"]
+        self._total_sentences += state["total_sentences"]
+        self._correct_sentences += state["correct_sentences"]
+        if state["ece_confidences"].numel():
+            self._ece_confidences.append(state["ece_confidences"])
+            self._ece_correct.append(state["ece_correct"])
+
     def reset(self) -> None:
         """Clear all running statistics."""
         self._total_tokens = 0
@@ -206,6 +246,14 @@ class TopKSentenceAccuracy:
         if self._total_sentences == 0:
             return 0.0
         return self._correct_sentences / self._total_sentences
+
+    @property
+    def correct_sentences(self) -> int:
+        return self._correct_sentences
+
+    @property
+    def total_sentences(self) -> int:
+        return self._total_sentences
 
     def reset(self) -> None:
         self._total_sentences = 0

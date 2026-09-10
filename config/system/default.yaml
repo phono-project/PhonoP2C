@@ -10,3 +10,7 @@ optim_paged: false
 gradient_checkpointing: true
 device: 'cuda'
 expandable_segments_enabled: true
+
+# torchrun / single-node DDP
+distributed_backend: 'nccl'
+distributed_timeout_minutes: 60

@@ -12,6 +12,13 @@ def main(cfg: DictConfig) -> None:
 
     import torch
     import logging
+    from utils.distributed import destroy_distributed, initialize_distributed
+
+    task_name = cfg.task.get("task_type", "train")
+    distributed = initialize_distributed(cfg.system) if task_name == "train" else None
+    if distributed is not None:
+        cfg.system.device = str(distributed.device)
+
     log_level = cfg.output.logging.log_level.upper()
     if log_level != "DEFAULT":
         numeric_level = getattr(logging, log_level, logging.WARNING)
@@ -28,7 +35,14 @@ def main(cfg: DictConfig) -> None:
         torch.backends.cudnn.allow_tf32 = True
 
     if cfg.system.get("set_seed", False):
-        seed = cfg.system.get("seed", 42)
+        import random
+        import numpy as np
+
+        seed = int(cfg.system.get("seed", 42))
+        if distributed is not None:
+            seed += distributed.rank
+        random.seed(seed)
+        np.random.seed(seed)
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed(seed)
@@ -38,23 +52,25 @@ def main(cfg: DictConfig) -> None:
     # Currently, FX graph cache is not supported when using Nested Tensor.
     torch._inductor.config.fx_graph_cache = False
 
-    # Dispatch to the appropriate task handler
-    task_name = cfg.task.get("task_type", "train")
+    # Dispatch to the appropriate task handler.
+    try:
+        if task_name == "preprocess":
+            from omegaconf import OmegaConf
+            from datasets_pipeline.preprocessor import run_preprocess
 
-    if task_name == "preprocess":
-        from omegaconf import OmegaConf
-        from datasets_pipeline.preprocessor import run_preprocess
-
-        dataset_cfg = OmegaConf.to_container(cfg.dataset, resolve=True)
-        run_preprocess(dataset_cfg, generate_val=cfg.task.get("generate_val", True))
-    elif task_name == "param_search":
-        from tasks.param_search import ParamSearchRunner
-        runner = ParamSearchRunner(cfg)
-        runner.run()
-    else:
-        from tasks.train import Trainer
-        trainer = Trainer(cfg)
-        trainer.train()
+            dataset_cfg = OmegaConf.to_container(cfg.dataset, resolve=True)
+            run_preprocess(dataset_cfg, generate_val=cfg.task.get("generate_val", True))
+        elif task_name == "param_search":
+            from tasks.param_search import ParamSearchRunner
+            runner = ParamSearchRunner(cfg)
+            runner.run()
+        else:
+            from tasks.train import Trainer
+            trainer = Trainer(cfg, distributed)
+            trainer.train()
+    finally:
+        if distributed is not None:
+            destroy_distributed()
 
 
 if __name__ == "__main__":
