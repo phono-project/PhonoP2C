@@ -9,7 +9,6 @@ conditional) are logged separately; pre and post models are saved
 individually.
 """
 
-import math
 import os
 import logging
 

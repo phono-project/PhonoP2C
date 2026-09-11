@@ -66,7 +66,8 @@ def initialize_distributed(system_cfg) -> DistributedContext:
     device_index = local_rank
     if device_index >= torch.cuda.device_count():
         raise RuntimeError(
-            f"LOCAL_RANK={local_rank}, but only {torch.cuda.device_count()} CUDA devices are visible."
+            f"LOCAL_RANK={local_rank}, but only "
+            f"{torch.cuda.device_count()} CUDA devices are visible."
         )
 
     device = torch.device("cuda", device_index)

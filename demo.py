@@ -99,7 +99,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def resolve_runtime(device_name: str, dtype_name: str) -> tuple[torch.device, torch.dtype]:
+def resolve_runtime(
+    device_name: str, dtype_name: str
+) -> tuple[torch.device, torch.dtype]:
     if device_name == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
