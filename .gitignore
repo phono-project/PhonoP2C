@@ -1,16 +1,37 @@
-__pycache__
-.pixi
+# Local environments and secrets
+.pixi/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python and tooling caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local editor and OS files
+.vscode/
+.DS_Store
+
+# Generated data, artifacts, and experiment state
+datasets/
+logs/
+wandb/
+checkpoints/
+target/
+legacy/
+outputs/
+models/
+exports/
+export_output/
+test/
+param_search_output/
+
+# The project currently resolves environments from pixi.toml.
 pixi.lock
-datasets
-logs
-wandb
-checkpoints
-target
-legacy
-outputs
-models
-exports
-export_output
-.vscode
-test
-param_search_output
