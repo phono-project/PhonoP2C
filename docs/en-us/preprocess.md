@@ -14,7 +14,7 @@ The department comprises:
 |---|---|---|
 | Corpus subsetter | `subset.py` | Extract a random subset of a large corpus into parquet |
 | Main pipeline | `preprocessor.py` | Normalize, segment, sample, annotate pinyin, write train/val datasets |
-| Tokenizer | `tokenizer.py` | Three-vocabulary tokenizer; encoding/decoding; pinyin->Chinese possibility map |
+| Tokenizer | `tokenizer/` | Three-vocabulary tokenizer; encoding/decoding; pinyin->Chinese possibility map |
 | Vocabulary assets | `vocabs/` | chinese_vocab.txt, context_vocab.txt, pinyin_vocab.txt, config.yaml |
 | Data layer for training | `dataset.py` | Online transforms (span selection, pinyin augmentation), NJT collate, streaming dataset |
 
@@ -201,7 +201,7 @@ The tokenizer is built from `vocabs/config.yaml` (`P2CTokenizer.from_config`).
 - Functionality: CLI entry.
 - Behavior: with `--preprocess`, builds the tokenizer, loads and processes all sources in order (JSONL, text-only, parquet), concatenates them, counts characters, splits train/val, writes the train MDS and the `val_original` Arrow dataset; with `--generate_val`, loads `val_original`, applies `_prepare_val_batch` (batched, 1 process), and saves `val` (1 shard). Raises `RuntimeError` when no data source is found; prints final row/character statistics.
 
-## 4. `tokenizer.py` — P2CTokenizer
+## 4. `tokenizer/` — P2CTokenizer
 
 **Functionality:** The three-vocabulary tokenizer used across all departments:
 

@@ -14,7 +14,7 @@
 |---|---|---|
 | 语料子集抽取 | `subset.py` | 从大语料中抽取随机子集并输出 parquet |
 | 主流水线 | `preprocessor.py` | 规范化、分段、采样、拼音标注，写出训练/验证集 |
-| 分词器 | `tokenizer.py` | 三词表分词器；编码/解码；拼音->汉字可能性掩码 |
+| 分词器 | `tokenizer/` | 三词表分词器；编码/解码；拼音->汉字可能性掩码 |
 | 词表资产 | `vocabs/` | chinese_vocab.txt、context_vocab.txt、pinyin_vocab.txt、config.yaml |
 | 训练数据层 | `dataset.py` | 在线变换（片段选择、拼音增强）、NJT collate、流式数据集 |
 
@@ -201,7 +201,7 @@
 - 功能：命令行入口。
 - 行为：`--preprocess` 时构建分词器，按序加载并处理所有数据源（JSONL、 纯文本、parquet），拼接，统计字符数，切分训练/验证，写出训练 MDS 与 `val_original` Arrow 数据集；`--generate_val` 时加载 `val_original`， 应用 `_prepare_val_batch`（批处理、单进程），保存 `val`（1 分片）。无任何 数据源时抛出 `RuntimeError`；结束时打印行数/字符数统计。
 
-## 4. `tokenizer.py` — P2CTokenizer
+## 4. `tokenizer/` — P2CTokenizer
 
 **功能：** 跨部门使用的三词表分词器：
 

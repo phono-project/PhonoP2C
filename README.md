@@ -8,7 +8,7 @@ PhonoP2C (Fast Pinyin-to-Chinese) is an end-to-end research project on pinyin-to
 
 - `main.py` / `tasks/` — Hydra 入口与训练、预处理任务
 - `datasets_pipeline/` — 数据层（`dataset.py`、`preprocessor.py`）与共享组件（`constants.py`、`pinyin.py`、`segments.py`）
-- `subset.py` / `tokenizer.py` — 语料子集抽取与三词表 tokenizer（含 `sample_heteronym` 异读采样）
+- `subset.py` / `tokenizer/` — 语料子集抽取与三词表 tokenizer（含 `sample_heteronym` 异读采样）
 - `model/` — 解码器 / 编码器、注意力、SwiGLU、MoE、RoPE、KV Cache 自定义算子、`beam_search.py`
 - `loss.py` / `metrics/` / `utils/` — 损失、评估指标（含 beam search Top-K 句准确率）与 float8 工具
 - `export/` / `demo.py` — Hydra ExecuTorch 导出任务与推理演示
@@ -18,7 +18,7 @@ PhonoP2C (Fast Pinyin-to-Chinese) is an end-to-end research project on pinyin-to
 
 - `main.py` / `tasks/` — Hydra entry point and train / preprocess tasks
 - `datasets_pipeline/` — data layer (`dataset.py`, `preprocessor.py`) and shared components (`constants.py`, `pinyin.py`, `segments.py`)
-- `subset.py` / `tokenizer.py` — corpus subsetting and the three-vocabulary tokenizer (incl. `sample_heteronym`)
+- `subset.py` / `tokenizer/` — corpus subsetting and the three-vocabulary tokenizer (incl. `sample_heteronym`)
 - `model/` — decoder / encoder, attention, SwiGLU, MoE, RoPE, custom KV-cache ops, `beam_search.py`
 - `loss.py` / `metrics/` / `utils/` — losses, metrics (incl. beam-search Top-K sentence accuracy), float8 utilities
 - `export/` / `demo.py` — Hydra ExecuTorch export task and inference demo
@@ -76,7 +76,7 @@ The project uses pixi (`pixi.toml`): Python 3.13, CUDA 13 runtime, PyTorch cu130
 
 项目文档按预处理、训练、导出与推理三个部门组织，每份文档按部门层和函数层描述组件，详细用法请阅读对应文档：
 
-- [预处理部门（preprocess.md）](docs/zh-cn/preprocess.md) — `subset.py`、`datasets_pipeline/preprocessor.py`、`tokenizer.py`、数据层
+- [预处理部门（preprocess.md）](docs/zh-cn/preprocess.md) — `subset.py`、`datasets_pipeline/preprocessor.py`、`tokenizer/`、数据层
 - [训练部门（train.md）](docs/zh-cn/train.md) — 模型架构、`main.py`、hydra 配置、Trainer、损失与指标
 - [导出与推理部门（export.md）](docs/zh-cn/export.md) — ExecuTorch 导出与推理演示
 
@@ -86,7 +86,7 @@ The project uses pixi (`pixi.toml`): Python 3.13, CUDA 13 runtime, PyTorch cu130
 
 The project documentation is organized into three departments — preprocess, train, export & inference — each describing components at department and function levels. For details, see:
 
-- [Preprocess department (preprocess.md)](docs/en-us/preprocess.md) — `subset.py`, `datasets_pipeline/preprocessor.py`, `tokenizer.py`, data layer
+- [Preprocess department (preprocess.md)](docs/en-us/preprocess.md) — `subset.py`, `datasets_pipeline/preprocessor.py`, `tokenizer/`, data layer
 - [Train department (train.md)](docs/en-us/train.md) — model architecture, `main.py`, hydra configs, Trainer, losses and metrics
 - [Export & Inference department (export.md)](docs/en-us/export.md) — ExecuTorch export and inference demo
 

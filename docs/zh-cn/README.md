@@ -16,7 +16,7 @@ PhonoP2C（Fast Pinyin-to-Chinese）是 PhonoP2C-collection 下的一个研究�
 | `main.py` | Hydra 入口；分发 train / preprocess 任务 |
 | `preprocessor.py` | 预处理流水线：原始语料转 MDS / Arrow 数据集 |
 | `subset.py` | 从语料中抽取随机子集并输出 parquet |
-| `tokenizer.py` | 三词表分词器（chinese / context / pinyin） |
+| `tokenizer/` | 三词表分词器（chinese / context / pinyin） |
 | `dataset.py` | 训练期数据变换、NJT collate、流式数据集 |
 | `loss.py` | 损失函数（交叉熵、focal、掩码感知的 label smoothing） |
 | `export/` | 将前/后段模型导出为 ExecuTorch .pte 文件的 Hydra task |
@@ -45,7 +45,7 @@ PhonoP2C（Fast Pinyin-to-Chinese）是 PhonoP2C-collection 下的一个研究�
 
 | 部门 | 文档 | 覆盖内容 | 入口命令 |
 |---|---|---|---|
-| 预处理 | `preprocess.md` | 原始语料转模型样本：`subset.py`、`preprocessor.py`、`tokenizer.py`、`vocabs/`，以及 `dataset.py` 的数据层 | `python subset.py`、`python preprocessor.py --preprocess` |
+| 预处理 | `preprocess.md` | 原始语料转模型样本：`subset.py`、`preprocessor.py`、`tokenizer/`、`vocabs/`，以及 `dataset.py` 的数据层 | `python subset.py`、`python preprocessor.py --preprocess` |
 | 训练 | `train.md` | 模型架构与联合训练流水线：`main.py`、`config/`、`tasks/train.py`、`model/`、`loss.py`、`metrics/`、`utils/float8.py` | `python main.py` |
 | 导出与推理 | `export.md` | ExecuTorch 导出（`export/`）与推理演示（`demo.py`） | `python main.py task=export`、`python demo.py` |
 
