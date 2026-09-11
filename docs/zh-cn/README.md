@@ -19,7 +19,7 @@ PhonoP2C（Fast Pinyin-to-Chinese）是 PhonoP2C-collection 下的一个研究�
 | `tokenizer.py` | 三词表分词器（chinese / context / pinyin） |
 | `dataset.py` | 训练期数据变换、NJT collate、流式数据集 |
 | `loss.py` | 损失函数（交叉熵、focal、掩码感知的 label smoothing） |
-| `export.py` | 将前/后段模型导出为 ExecuTorch .pte 文件 |
+| `export/` | 将前/后段模型导出为 ExecuTorch .pte 文件的 Hydra task |
 | `demo.py` | 参数化推理 CLI（greedy / beam search） |
 | `tasks/train.py` | Trainer：联合训练循环、验证、checkpoint |
 | `model/config.py` | PreModelConfig / PostModelConfig 及 YAML 转配置的构建器 |
@@ -47,7 +47,7 @@ PhonoP2C（Fast Pinyin-to-Chinese）是 PhonoP2C-collection 下的一个研究�
 |---|---|---|---|
 | 预处理 | `preprocess.md` | 原始语料转模型样本：`subset.py`、`preprocessor.py`、`tokenizer.py`、`vocabs/`，以及 `dataset.py` 的数据层 | `python subset.py`、`python preprocessor.py --preprocess` |
 | 训练 | `train.md` | 模型架构与联合训练流水线：`main.py`、`config/`、`tasks/train.py`、`model/`、`loss.py`、`metrics/`、`utils/float8.py` | `python main.py` |
-| 导出与推理 | `export.md` | ExecuTorch 导出（`export.py`）与推理演示（`demo.py`） | `python export.py`、`python demo.py` |
+| 导出与推理 | `export.md` | ExecuTorch 导出（`export/`）与推理演示（`demo.py`） | `python main.py task=export`、`python demo.py` |
 
 ### 3.1 预处理部门
 
@@ -59,14 +59,14 @@ hydra 驱动的联合训练器：根据配置构建两个子模型，由分词�
 
 ### 3.3 导出与推理部门
 
-训练完成后，`export.py` 冻结并导出包含多个 pre 方法的程序和 post 编码器为 ExecuTorch `.pte` 文件，采用 XNNPACK 动态逐通道量化；`demo.py` 在 PyTorch 中提供参数化的 greedy 与 beam-search 推理。
+训练完成后，`export` task 冻结并导出包含多个 pre 方法的程序和 post 编码器为 ExecuTorch `.pte` 文件，并应用配置的 XNNPACK 量化；`demo.py` 在 PyTorch 中提供参数化的 greedy 与 beam-search 推理。
 
 ## 4. 端到端数据流（文字描述）
 
 1. **语料获取** — 原始数据建议存放于 `datasets/pretrain_base`，数据处理器支持 LCCC、MMC、CLUE、wikipedia、zhihu-kol、fineweb 等 JSONL、Parquet 格式的数据。超大语料可先用 `subset.py` 抽取子集。
 2. **预处理** — `preprocessor.py` 规范化每条文本，分段，切成 16–64 字符的样本，计算嵌套的逐字拼音，输出 `datasets/pretrain_v2/train`（MDS，默认zstd压缩）和 `datasets/pretrain_v2/val`（HF Arrow，物化 prefix/suffix/pinyin 对）。
 3. **训练** — `main.py` 加载 hydra 配置；`Trainer` 构建分词器、可能性掩码、两个模型，并流式读取 MDS 训练批次。每个批次在线变换（片段选择、拼音增强）后 collate 为 NJT，送入 pre -> post 模型。post 模型的 logits 被可能性掩码过滤后计算损失，两个模型联合优化。验证集为 Arrow 格式，周期性验证。每轮保存 `pre_model` / `post_model` checkpoint。
-4. **导出** — `export.py` 加载最终 checkpoint，导出 pre 方法和 post 编码器，应用 XNNPACK 动态量化，写出 `pre_model.pte` / `post_model.pte`。
+4. **导出** — `main.py task=export` 加载配置的 checkpoint，导出 pre 方法和 post 编码器，应用配置的 XNNPACK 量化，写出 `pre_model.pte` / `post_model.pte`。
 5. **推理** — `demo.py` 编码拼音一次，再使用带 self-KV Cache 的 pre 条件 pass，以 greedy 或 beam search 完成拼音转汉字。
 
 ## 5. 运行环境
@@ -78,7 +78,7 @@ hydra 驱动的联合训练器：根据配置构建两个子模型，由分词�
 - `python preprocessor.py --preprocess` — 完整预处理。
 - `python preprocessor.py --generate_val` — 物化验证集。
 - `python main.py` — 训练（可通过 Hydra 覆盖配置）。
-- `python export.py` — ExecuTorch 导出。
+- `python main.py task=export` — ExecuTorch 导出。
 - `python demo.py --checkpoint <目录> --pinyin <音节...>` — 推理演示。
 
 > **已知问题的临时说明：** 在当前 Python 3.13 环境下，PyTorch 稳定版对于 NJT 的 `torch.compile` 支持存在已知上游漏洞，表现为 `torch._inductor.exc.InductorError: AssertionError` 符号生成错误。

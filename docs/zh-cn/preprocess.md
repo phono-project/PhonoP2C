@@ -211,7 +211,7 @@
 
 它还构建用于过滤 post 模型非法 logits 的拼音->汉字**可能性掩码**。
 
-**用法：** `P2CTokenizer.from_config("vocabs/config.yaml")`；被 `preprocessor.py`（过滤）、`dataset.py`（编码）、`tasks/train.py`（词表大小 + 掩码）、`demo.py`、`export.py` 使用。
+**用法：** `P2CTokenizer.from_config("vocabs/config.yaml")`；被 `preprocessor.py`（过滤）、`dataset.py`（编码）、`tasks/train.py`（词表大小 + 掩码）、`demo.py` 和 `export` task 使用。
 
 ### `_read_vocab_tokens(path)`
 - 功能：读取 unigram 词表文件（每行一个 token）。

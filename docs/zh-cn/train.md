@@ -18,7 +18,7 @@
 
 **功能：** hydra 装饰的入口 （`@hydra.main(version_base=None, config_path="config", config_name="config")`）。 加载完整配置，应用全局运行时设置，并分发到指定的任务运行器。
 
-**用法：** `python main.py`（训练，按 `config/task/train.yaml`），或 `python main.py task=preprocess`（预处理）。
+**用法：** `python main.py`（训练）、`python main.py task=preprocess`，或 `python main.py task=export`。
 
 ### 单机多卡 DDP
 
@@ -49,7 +49,7 @@ PyTorch 2.13 中，DDP 与 NJT activation checkpoint 重算组合会为同一 ra
 - `system.tf32_enabled` 时启用 matmul 与 cudnn 的 TF32。
 - `system.set_seed` 时可选地固定 CPU/GPU 随机种子（默认 42）。
 - 设置 `torch.set_float32_matmul_precision("high")` 并关闭 inductor FX graph cache（NJT 兼容性）。
-- 分发预处理到 `run_preprocess`；训练使用 `Trainer.train()`。
+- 分发预处理到 `run_preprocess`、导出到 `run_export`，训练使用 `Trainer.train()`。
 
 ## 3. `config/` — hydra 配置
 
@@ -78,6 +78,8 @@ PyTorch 2.13 中，DDP 与 NJT activation checkpoint 重算组合会为同一 ra
 ### `config/output/default.yaml` — 输出行为
 - `progress_bar`：条宽、刷新率、已用/剩余时间、速度、比例列、 `transient: true`。
 - `logging.log_level: "ERROR"`（或 `DEFAULT`）。
+
+导出任务使用独立的 `config/task/export.yaml`，详见 `export.md`。
 
 ## 4. `tasks/train.py` — Trainer
 

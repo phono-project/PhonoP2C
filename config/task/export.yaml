@@ -1,0 +1,42 @@
+task_type: export
+
+# Input checkpoint containing pre_model/ and post_model/ directories.
+checkpoint_dir: ./checkpoints/v2_0-base-alpha05/final_model
+
+# Output programs and selective-build manifests.
+output_dir: ./export_output
+outputs:
+  pre_model: pre_model.pte
+  post_model: post_model.pte
+  manifests_dir: manifests
+
+# ExecuTorch/XNNPACK export currently targets CPU.
+device: cpu
+dtype: float32
+
+model_metadata:
+  version: v2_1-base-alpha05
+  format_version: "2.1"
+
+# Representative inputs used to capture dynamic graphs.
+example_inputs:
+  beam_size: 3
+  prefix_length: 4
+  current_sequence_length: 8
+  post_length: 4
+  max_candidate_width: 64
+
+quantization:
+  # Supported modes: none, w8a8, w4a8.
+  mode: w4a8
+  per_channel: true
+  dynamic: true
+
+export:
+  strict: true
+  print_graphs: false
+  alloc_graph_input: false
+
+manifests:
+  enabled: true
+  tag: ${task.model_metadata.version}

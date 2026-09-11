@@ -9,8 +9,11 @@ The new-standard architecture exports two programs:
   * post_model.pte — the pinyin encoder: hidden states + logits mask.
 """
 
-import os
+from pathlib import Path
+
 import torch
+from hydra.utils import to_absolute_path
+from omegaconf import DictConfig
 from torch.export import Dim
 from model.model import PhonoP2CPreModel, PhonoP2CPostModel
 
@@ -21,13 +24,11 @@ from executorch.exir.passes import MemoryPlanningPass
 from torch.fx.passes.infra.partitioner import Partition
 from torch.fx.passes.utils.fuser_utils import validate_partition
 
-CHECKPOINT_DIR = "./checkpoints/v2_0-base-alpha05/final_model"
-MODEL_TYPE = torch.float32
-SAVE_DIR = "./export_output"
-MODEL_VERSION = "v2_1-base-alpha05"
-MODEL_FORMAT_VERSION = "2.1"
-BEAM_SIZE = 3
-QUANTIZATION = "w4a8"  # "w8a8", "w4a8", or "none"
+DTYPES = {
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+}
 
 
 class _CrossKvProjector(torch.nn.Module):
@@ -77,25 +78,25 @@ class _ContiguousXnnpackPartitioner(XnnpackPartitioner):
         return [Partition(id=index, nodes=nodes) for index, nodes in enumerate(runs)]
 
 
-# Where the per-model + merged ExecuTorch selective-build manifests are written
-# after export. ExecuTorch's own gen_oplist can only derive an operator list
-# from a single .pte file, so the manifests are generated here, spanning all
-# exported programs. Copy them into phono-core/ops_config/ before building
-# phono-core to prune its kernel library to exactly the operators and dtypes
-# the models use (see phono-core/CMakeLists.txt).
-MANIFEST_DIR = os.path.join(SAVE_DIR, "manifests")
-MANIFEST_TAG = MODEL_VERSION
+def _absolute_path(path: str | Path) -> Path:
+    """Resolve a configured path against Hydra's original working directory."""
+    return Path(to_absolute_path(str(Path(path).expanduser())))
 
 
-def load_model_from_checkpoint(checkpoint_dir: str, device: torch.device):
+def load_model_from_checkpoint(checkpoint_dir: str | Path, device: torch.device):
     """Load pre and post models from a checkpoint directory.
 
     The directory should contain:
       pre_model/  — save_pretrained output (config.json + model.safetensors)
       post_model/ — save_pretrained output (config.json + model.safetensors)
     """
-    pre_path = os.path.join(checkpoint_dir, "pre_model")
-    post_path = os.path.join(checkpoint_dir, "post_model")
+    checkpoint_dir = Path(checkpoint_dir)
+    pre_path = checkpoint_dir / "pre_model"
+    post_path = checkpoint_dir / "post_model"
+    if not pre_path.is_dir() or not post_path.is_dir():
+        raise FileNotFoundError(
+            f"{checkpoint_dir} must contain pre_model/ and post_model/ directories"
+        )
 
     pre_model = PhonoP2CPreModel.from_pretrained(pre_path).to(device)
     post_model = PhonoP2CPostModel.from_pretrained(post_path).to(device)
@@ -105,17 +106,25 @@ def load_model_from_checkpoint(checkpoint_dir: str, device: torch.device):
     return pre_model, post_model
 
 
-def prepare_exported(exported_module, example_kwargs, dynamic_shapes):
-    """Apply QUANTIZATION and return an ExportedProgram."""
-    if QUANTIZATION == "none":
+def prepare_exported(
+    exported_module,
+    example_kwargs,
+    dynamic_shapes,
+    quantization_cfg: DictConfig,
+    strict: bool,
+):
+    """Apply the configured quantization and return an ExportedProgram."""
+    mode = str(quantization_cfg.mode).lower()
+    if mode == "none":
         return torch.export.export(
             exported_module,
             args=(),
             kwargs=example_kwargs,
             dynamic_shapes=dynamic_shapes,
+            strict=strict,
         )
-    if QUANTIZATION not in {"w8a8", "w4a8"}:
-        raise ValueError(f"Unsupported QUANTIZATION: {QUANTIZATION}")
+    if mode not in {"w8a8", "w4a8"}:
+        raise ValueError(f"Unsupported quantization mode: {mode}")
 
     from torchao.quantization.pt2e.quantize_pt2e import prepare_pt2e, convert_pt2e
 
@@ -125,14 +134,14 @@ def prepare_exported(exported_module, example_kwargs, dynamic_shapes):
     )
 
     quantizer = XNNPACKQuantizer()
-    weight_range = {} if QUANTIZATION == "w8a8" else {
+    weight_range = {} if mode == "w8a8" else {
         "weight_qmin": -8,
         "weight_qmax": 7,
     }
     quantizer.set_global(
         get_symmetric_quantization_config(
-            is_per_channel=True,
-            is_dynamic=True,
+            is_per_channel=bool(quantization_cfg.per_channel),
+            is_dynamic=bool(quantization_cfg.dynamic),
             **weight_range,
         )
     )
@@ -155,12 +164,13 @@ def prepare_exported(exported_module, example_kwargs, dynamic_shapes):
         args=(),
         kwargs=example_kwargs,
         dynamic_shapes=dynamic_shapes,
+        strict=strict,
     )
 
     return quantized_exported
 
 
-def lower_and_save(programs, save_path):
+def lower_and_save(programs, save_path: Path, alloc_graph_input: bool):
     """Lower one or more named graphs into a single ExecuTorch program."""
     # Lower independently before EdgeProgramManager composes the multi-method
     # PTE, preserving shared-constant deduplication.
@@ -179,13 +189,15 @@ def lower_and_save(programs, save_path):
     edge_program = EdgeProgramManager(lowered_methods)
     executorch_program = edge_program.to_executorch(
         ExecutorchBackendConfig(
-            memory_planning_pass=MemoryPlanningPass(alloc_graph_input=False),
+            memory_planning_pass=MemoryPlanningPass(
+                alloc_graph_input=alloc_graph_input
+            ),
         )
     )
 
-    with open(save_path, "wb") as f:
+    with save_path.open("wb") as f:
         executorch_program.write_to_file(f)
-    print(f"Saved {os.path.basename(save_path)} to {save_path}")
+    print(f"Saved {save_path.name} to {save_path}")
 
 
 def _collect_ops_metadata(pte_path):
@@ -236,29 +248,35 @@ def _dump_ops_manifest(ops, metadata, model_name, path):
         f.write(yaml.safe_dump(output, default_flow_style=False).encode("utf-8"))
 
 
-def generate_ops_manifests():
+def generate_ops_manifests(
+    output_dir: Path,
+    manifest_dir: Path,
+    manifest_tag: str,
+    pre_filename: str,
+    post_filename: str,
+):
     """Generate per-model + merged ExecuTorch selective-build manifests.
 
     phono-core deploys two programs (pre_model.pte + post_model.pte) on one
     runtime, but ExecuTorch's upstream tooling can only build an operator list
     from a single .pte model. This reads the serialized programs and writes:
 
-      * <MANIFEST_TAG>_pre_ops.yaml / <MANIFEST_TAG>_post_ops.yaml — per-model
+      * <tag>_pre_ops.yaml / <tag>_post_ops.yaml — per-model
         manifests (operators + dtype/dim-order kernel metadata), and
-      * <MANIFEST_TAG>_ops.yaml — their union, for a combined build.
+      * <tag>_ops.yaml — their union, for a combined build.
 
     Copy whichever you need into phono-core/ops_config/ before building
     phono-core.
     """
-    os.makedirs(MANIFEST_DIR, exist_ok=True)
+    manifest_dir.mkdir(parents=True, exist_ok=True)
 
     per_model = {}
-    for tag, pte_name in (("pre", "pre_model.pte"), ("post", "post_model.pte")):
-        pte_path = os.path.join(SAVE_DIR, pte_name)
+    for tag, pte_name in (("pre", pre_filename), ("post", post_filename)):
+        pte_path = output_dir / pte_name
         ops, metadata = _collect_ops_metadata(pte_path)
         per_model[tag] = (ops, metadata)
-        out = os.path.join(MANIFEST_DIR, f"{MANIFEST_TAG}_{tag}_ops.yaml")
-        _dump_ops_manifest(ops, metadata, f"{MANIFEST_TAG}-{tag}", out)
+        out = manifest_dir / f"{manifest_tag}_{tag}_ops.yaml"
+        _dump_ops_manifest(ops, metadata, f"{manifest_tag}-{tag}", out)
         print(f"Manifest {tag}: {len(ops)} operators -> {out}")
 
     all_ops = sorted(set().union(*(ops for ops, _ in per_model.values())))
@@ -269,20 +287,55 @@ def generate_ops_manifests():
             for key in keys:
                 if key not in seen:
                     seen.append(key)
-    merged_out = os.path.join(MANIFEST_DIR, f"{MANIFEST_TAG}_ops.yaml")
-    _dump_ops_manifest(all_ops, merged_metadata, MANIFEST_TAG, merged_out)
+    merged_out = manifest_dir / f"{manifest_tag}_ops.yaml"
+    _dump_ops_manifest(all_ops, merged_metadata, manifest_tag, merged_out)
     print(f"Manifest merged: {len(all_ops)} operators -> {merged_out}")
 
 
-if __name__ == "__main__":
-    device = torch.device("cpu")
+def run_export(task_cfg: DictConfig) -> None:
+    """Run the ExecuTorch export task from its Hydra configuration."""
+    device = torch.device(str(task_cfg.device))
+    if device.type != "cpu":
+        raise ValueError("ExecuTorch XNNPACK export currently requires task.device=cpu")
+    try:
+        dtype = DTYPES[str(task_cfg.dtype).lower()]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported export dtype {task_cfg.dtype!r}; choose one of {sorted(DTYPES)}"
+        ) from exc
+
+    checkpoint_dir = _absolute_path(task_cfg.checkpoint_dir)
+    output_dir = _absolute_path(task_cfg.output_dir)
+    pre_filename = str(task_cfg.outputs.pre_model)
+    post_filename = str(task_cfg.outputs.post_model)
+    manifest_dir = output_dir / str(task_cfg.outputs.manifests_dir)
+    example_cfg = task_cfg.example_inputs
+    beam_size = int(example_cfg.beam_size)
+    if beam_size <= 0:
+        raise ValueError("example_inputs.beam_size must be positive")
+    dummy_new_prefix_len = int(example_cfg.prefix_length)
+    dummy_current_seqlen = int(example_cfg.current_sequence_length)
+    dummy_post_len = int(example_cfg.post_length)
+    max_candidate_width = int(example_cfg.max_candidate_width)
+    if dummy_new_prefix_len <= 0 or dummy_post_len <= 0:
+        raise ValueError("example input sequence lengths must be positive")
+    if dummy_current_seqlen < 0:
+        raise ValueError("example_inputs.current_sequence_length cannot be negative")
+    if max_candidate_width <= 0:
+        raise ValueError("example_inputs.max_candidate_width must be positive")
+
+    print(
+        f"Exporting {task_cfg.model_metadata.version} "
+        f"(format {task_cfg.model_metadata.format_version}, "
+        f"quantization={task_cfg.quantization.mode})"
+    )
 
     pre_model, post_model = load_model_from_checkpoint(
-        checkpoint_dir=CHECKPOINT_DIR,
+        checkpoint_dir=checkpoint_dir,
         device=device,
     )
-    pre_model.to(MODEL_TYPE)
-    post_model.to(MODEL_TYPE)
+    pre_model.to(dtype)
+    post_model.to(dtype)
 
     for param in pre_model.parameters():
         param.requires_grad = False
@@ -310,30 +363,31 @@ if __name__ == "__main__":
             pre_self_head_dim,
         ),
         device=device,
-        dtype=MODEL_TYPE,
+        dtype=dtype,
     )
     dummy_pre2_kv_cache = torch.zeros(
         (
             pre_cfg.mhsa_layers,
             2,
-            BEAM_SIZE,
+            beam_size,
             pre_cfg.max_seqlen,
             pre_self_nheads,
             pre_self_head_dim,
         ),
         device=device,
-        dtype=MODEL_TYPE,
+        dtype=dtype,
     )
 
-    dummy_new_prefix_len = 4
-    dummy_current_seqlen = 8  # tokens already resident in the caches
-    dummy_post_len = 4
+    if dummy_current_seqlen + dummy_new_prefix_len > pre_cfg.max_seqlen:
+        raise ValueError("example prefix and cache lengths exceed pre_model.max_seqlen")
+    if dummy_post_len > post_cfg.max_seqlen:
+        raise ValueError("example_inputs.post_length exceeds post_model.max_seqlen")
 
     dummy_pre1_input_ids = torch.randint(
         low=0, high=pre_cfg.vocab_size, size=(1, dummy_new_prefix_len), dtype=torch.long
     )
     dummy_pre2_input_ids = torch.randint(
-        low=0, high=pre_cfg.vocab_size, size=(BEAM_SIZE, 1), dtype=torch.long
+        low=0, high=pre_cfg.vocab_size, size=(beam_size, 1), dtype=torch.long
     )
     dummy_pre_cache_pos = torch.tensor(
         [dummy_current_seqlen], dtype=torch.long, device=device
@@ -360,7 +414,7 @@ if __name__ == "__main__":
         args=(),
         kwargs=pre1_example_kwargs,
         dynamic_shapes=pre1_dynamic_shapes,
-        strict=True,
+        strict=bool(task_cfg.export.strict),
     ).module()
 
     # ---------------------------------------------------------------- post model
@@ -375,15 +429,17 @@ if __name__ == "__main__":
         args=(),
         kwargs=post_example_kwargs,
         dynamic_shapes=post_dynamic_shapes,
-        strict=True,
+        strict=bool(task_cfg.export.strict),
     ).module()
 
     # ---------------------------------------------------------------- pre pass 2
     dummy_post_hidden = torch.zeros(
-        (1, dummy_post_len, post_cfg.model_dim), device=device, dtype=MODEL_TYPE
+        (1, dummy_post_len, post_cfg.model_dim), device=device, dtype=dtype
     )
     dummy_cross_kv = cross_kv_projector(dummy_post_hidden)
-    dummy_candidate_ids = torch.zeros(min(64, candidate_width), dtype=torch.long)
+    dummy_candidate_ids = torch.zeros(
+        min(max_candidate_width, candidate_width), dtype=torch.long
+    )
     # Local cross-attn positions: pinyin key offset 1, query step = chunk start.
     dummy_post_position_offset = torch.tensor(1, dtype=torch.long, device=device)
     dummy_cross_q_pos_start = torch.tensor(0, dtype=torch.long, device=device)
@@ -416,7 +472,7 @@ if __name__ == "__main__":
         args=(),
         kwargs=pre2_example_kwargs,
         dynamic_shapes=pre2_dynamic_shapes,
-        strict=True,
+        strict=bool(task_cfg.export.strict),
     ).module()
 
     cross_example_kwargs = {"post_hidden": dummy_post_hidden}
@@ -428,34 +484,63 @@ if __name__ == "__main__":
         args=(),
         kwargs=cross_example_kwargs,
         dynamic_shapes=cross_dynamic_shapes,
-        strict=True,
+        strict=bool(task_cfg.export.strict),
     ).module()
 
-    if os.environ.get("PHONOP2C_EXPORT_PRINT_GRAPHS"):
+    if task_cfg.export.print_graphs:
         exported_pre1.print_readable()
         exported_pre2.print_readable()
         exported_post.print_readable()
 
-    os.makedirs(SAVE_DIR, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     quantized_pre_programs = {
         "pre_model_pass1": prepare_exported(
-            exported_pre1, pre1_example_kwargs, pre1_dynamic_shapes
+            exported_pre1,
+            pre1_example_kwargs,
+            pre1_dynamic_shapes,
+            task_cfg.quantization,
+            bool(task_cfg.export.strict),
         ),
         "pre_model_pass2": prepare_exported(
-            exported_pre2, pre2_example_kwargs, pre2_dynamic_shapes
+            exported_pre2,
+            pre2_example_kwargs,
+            pre2_dynamic_shapes,
+            task_cfg.quantization,
+            bool(task_cfg.export.strict),
         ),
         "pre_model_cross_kv": prepare_exported(
-            exported_cross_kv, cross_example_kwargs, cross_dynamic_shapes
+            exported_cross_kv,
+            cross_example_kwargs,
+            cross_dynamic_shapes,
+            task_cfg.quantization,
+            bool(task_cfg.export.strict),
         ),
     }
-    lower_and_save(quantized_pre_programs, os.path.join(SAVE_DIR, "pre_model.pte"))
+    lower_and_save(
+        quantized_pre_programs,
+        output_dir / pre_filename,
+        bool(task_cfg.export.alloc_graph_input),
+    )
 
     quantized_post = prepare_exported(
-        exported_post, post_example_kwargs, post_dynamic_shapes
+        exported_post,
+        post_example_kwargs,
+        post_dynamic_shapes,
+        task_cfg.quantization,
+        bool(task_cfg.export.strict),
     )
     lower_and_save(
-        {"post_model": quantized_post}, os.path.join(SAVE_DIR, "post_model.pte")
+        {"post_model": quantized_post},
+        output_dir / post_filename,
+        bool(task_cfg.export.alloc_graph_input),
     )
 
-    generate_ops_manifests()
+    if task_cfg.manifests.enabled:
+        generate_ops_manifests(
+            output_dir=output_dir,
+            manifest_dir=manifest_dir,
+            manifest_tag=str(task_cfg.manifests.tag),
+            pre_filename=pre_filename,
+            post_filename=post_filename,
+        )

@@ -211,7 +211,7 @@ The tokenizer is built from `vocabs/config.yaml` (`P2CTokenizer.from_config`).
 
 It also builds the pinyin->Chinese **possibility map** used to mask impossible post-model logits.
 
-**Usage:** `P2CTokenizer.from_config("vocabs/config.yaml")`; in `preprocessor.py` (filtering), `dataset.py` (encoding), `tasks/train.py` (sizes + mask), `demo.py`, and `export.py`.
+**Usage:** `P2CTokenizer.from_config("vocabs/config.yaml")`; in `preprocessor.py` (filtering), `dataset.py` (encoding), `tasks/train.py` (sizes + mask), `demo.py`, and the `export` task.
 
 ### `_read_vocab_tokens(path)`
 - Functionality: reads a unigram vocab file (one token per line).

@@ -60,6 +60,10 @@ def main(cfg: DictConfig) -> None:
 
             dataset_cfg = OmegaConf.to_container(cfg.dataset, resolve=True)
             run_preprocess(dataset_cfg, generate_val=cfg.task.get("generate_val", True))
+        elif task_name == "export":
+            from export import run_export
+
+            run_export(cfg.task)
         else:
             from tasks.train import Trainer
             trainer = Trainer(cfg, distributed)

@@ -19,7 +19,7 @@ The input is therefore "Chinese context + pinyin syllables", and the output is "
 | `tokenizer.py` | three-vocabulary tokenizer (chinese / context / pinyin) |
 | `dataset.py` | training-time data transforms, NJT collate, streaming dataset |
 | `loss.py` | loss functions (cross-entropy, focal, mask-aware label smoothing) |
-| `export.py` | exports pre/post models to ExecuTorch `.pte` files |
+| `export/` | Hydra task that exports pre/post models to ExecuTorch `.pte` files |
 | `demo.py` | parameterized inference CLI (greedy / beam search) |
 | `tasks/train.py` | Trainer: joint training loop, validation, checkpointing |
 | `model/config.py` | PreModelConfig / PostModelConfig + YAML-to-config builder |
@@ -47,7 +47,7 @@ The documentation is organized into three departments (phases of the project lif
 |---|---|---|---|
 | Preprocess | `preprocess.md` | Turning raw text corpora into model-ready samples: `subset.py`, `preprocessor.py`, `tokenizer.py`, `vocabs/`, and the data layer of `dataset.py` | `python subset.py`, `python preprocessor.py --preprocess` |
 | Train | `train.md` | Model architecture and the joint training pipeline: `main.py`, `config/`, `tasks/train.py`, `model/`, `loss.py`, `metrics/`, `utils/float8.py` | `python main.py` |
-| Export & Inference | `export.md` | ExecuTorch export (`export.py`) and the inference demo (`demo.py`) | `python export.py`, `python demo.py` |
+| Export & Inference | `export.md` | ExecuTorch export (`export/`) and the inference demo (`demo.py`) | `python main.py task=export`, `python demo.py` |
 
 ### 3.1 Preprocess department
 
@@ -59,14 +59,14 @@ A hydra-driven joint trainer builds the two sub-models from config, computes the
 
 ### 3.3 Export & Inference department
 
-After training, `export.py` freezes and exports a multi-method pre program plus a post encoder to ExecuTorch `.pte` files with XNNPACK dynamic per-channel quantization. `demo.py` provides parameterized greedy and beam-search inference in PyTorch.
+After training, the `export` task freezes and exports a multi-method pre program plus a post encoder to ExecuTorch `.pte` files with configurable XNNPACK quantization. `demo.py` provides parameterized greedy and beam-search inference in PyTorch.
 
 ## 4. End-to-End Data Flow (prose)
 
 1. **Corpus acquisition** — It is recommended to store raw data in `datasets/pretrain_base`. The data processor supports data in JSONL / Parquet formats from sources such as LCCC, MMC, CLUE, Wikipedia, Zhihu-KOL, and FineWeb. For very large corpora, using `subset.py` to extract a subset is recommended.
 2. **Preprocessing** — `preprocessor.py` normalizes each text, segments it, slices samples of 16–64 characters, computes nested per-character pinyin, and writes `datasets/pretrain_v2/train` (MDS, zstd) plus `datasets/pretrain_v2/val` (HF Arrow with materialized prefix/suffix/pinyin pairs).
 3. **Training** — `main.py` loads hydra config; `Trainer` builds the tokenizer, the possibility mask, both models, and streams MDS training batches. Each batch is transformed online (span selection, pinyin augmentation), collated into NJTs, and fed to pre -> post models. The post logits are masked by the possibility mask, the loss is computed, and both models are optimized jointly. Validation runs periodically on the Arrow val set. Checkpoints are saved per epoch as `pre_model` / `post_model` subdirectories.
-4. **Export** — `export.py` loads the final checkpoint, exports the pre methods and post encoder, applies XNNPACK dynamic quantization, and writes `pre_model.pte` / `post_model.pte`.
+4. **Export** — `main.py task=export` loads the configured checkpoint, exports the pre methods and post encoder, applies the configured XNNPACK quantization, and writes `pre_model.pte` / `post_model.pte`.
 5. **Inference** — `demo.py` encodes pinyin once, then runs the pre decoder's conditional pass with self-KV cache state and decodes with greedy or beam search.
 
 ## 5. Environment
@@ -78,7 +78,7 @@ The project uses pixi (`pixi.toml`): Python 3.13, CUDA 13 runtime, PyTorch cu130
 - `python preprocessor.py --preprocess` — full preprocessing.
 - `python preprocessor.py --generate_val` — materialize the val dataset.
 - `python main.py` — train (configuration can be overridden via Hydra).
-- `python export.py` — ExecuTorch export.
+- `python main.py task=export` — ExecuTorch export.
 - `python demo.py --checkpoint <dir> --pinyin <syllables...>` — inference demo.
 
 > **Temporary note on known issues:** In the current Python 3.13 environment, the stable version of PyTorch has a known upstream bug regarding support for NJT’s `torch.compile`, which manifests as a symbol generation error `torch._inductor.exc.InductorError: AssertionError`.
