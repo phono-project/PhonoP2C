@@ -53,8 +53,6 @@ PhonoP2C (Fast Pinyin-to-Chinese) is an end-to-end research project on pinyin-to
 - `python tools/build_pack_v2_2.py --help` — 校验导出产物并构建 phono-core v2.2 模型包。
 - `python demo.py --checkpoint <目录> --text <上下文> --pinyin <音节...>` — 推理演示。
 
-> **已知问题的临时说明：** 在当前 Python 3.13 环境下，PyTorch 稳定版对于 NJT 的 `torch.compile` 支持存在已知上游漏洞，表现为 `torch._inductor.exc.InductorError: AssertionError` 符号生成错误。如果您更需要使用 torch.compile 特性，请**按照现在 pixi.toml 默认的状态使用 PyTorch Nightly**，已知 PyTorch Nightly 下可以正常使用 torch.compile 编译该模型。如果您更需要使用稳定版，可在 `config/task/train.yaml` 中将 `compile_model` 设置为 `false`。
-
 ## Environment
 
 The project uses pixi (`pixi.toml`): Python 3.13, CUDA 13 runtime, PyTorch cu130 build, plus jieba, pypinyin, zhconv-rs, streaming (MosaicML), datasets, hydra-core, wandb, netcal, torchao, bitsandbytes, executorch, and quality tools (black, isort, flake8, mypy). Typical workflow commands:
@@ -67,8 +65,6 @@ The project uses pixi (`pixi.toml`): Python 3.13, CUDA 13 runtime, PyTorch cu130
 - `python main.py task=export` — ExecuTorch export; inputs, outputs, example graph dimensions, quantization, and manifest options are configured in `config/task/export.yaml`.
 - `python tools/build_pack_v2_2.py --help` — validate exported artifacts and build a phono-core v2.2 model package.
 - `python demo.py --checkpoint <dir> --text <context> --pinyin <syllables...>` — inference demo.
-
-> **Temporary note on known issues:** In the current Python 3.13 environment, the stable version of PyTorch has a known upstream bug regarding support for NJT’s `torch.compile`, which manifests as a symbol generation error `torch._inductor.exc.InductorError: AssertionError`. If you require the `torch.compile` feature, please **use PyTorch Nightly as is currently the default in pixi.toml**; it is known that `torch.compile` works correctly when compiling this model with PyTorch Nightly. If you prefer to use the stable release, you can set `compile_model` to `false` in `config/task/train.yaml`.
 
 ## 文档
 
