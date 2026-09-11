@@ -10,7 +10,7 @@ PhonoP2C (Fast Pinyin-to-Chinese) is an end-to-end research project on pinyin-to
 - `datasets_pipeline/` — 数据层（`dataset.py`、`preprocessor.py`）与共享组件（`constants.py`、`pinyin.py`、`segments.py`）
 - `subset.py` / `tokenizer/` — 语料子集抽取与三词表 tokenizer（含 `sample_heteronym` 异读采样）
 - `model/` — 解码器 / 编码器、注意力、SwiGLU、MoE、RoPE、KV Cache 自定义算子、`beam_search.py`
-- `loss.py` / `metrics/` / `utils/` — 损失、评估指标（含 beam search Top-K 句准确率）与 float8 工具
+- `loss/` / `metrics/` / `utils/` — 损失、评估指标（含 beam search Top-K 句准确率）与 float8 工具
 - `export/` / `demo.py` — Hydra ExecuTorch 导出任务与推理演示
 - `config/` / `vocabs/` / `datasets/` / `checkpoints/` — 配置、词表、数据与产出
 
@@ -20,7 +20,7 @@ PhonoP2C (Fast Pinyin-to-Chinese) is an end-to-end research project on pinyin-to
 - `datasets_pipeline/` — data layer (`dataset.py`, `preprocessor.py`) and shared components (`constants.py`, `pinyin.py`, `segments.py`)
 - `subset.py` / `tokenizer/` — corpus subsetting and the three-vocabulary tokenizer (incl. `sample_heteronym`)
 - `model/` — decoder / encoder, attention, SwiGLU, MoE, RoPE, custom KV-cache ops, `beam_search.py`
-- `loss.py` / `metrics/` / `utils/` — losses, metrics (incl. beam-search Top-K sentence accuracy), float8 utilities
+- `loss/` / `metrics/` / `utils/` — losses, metrics (incl. beam-search Top-K sentence accuracy), float8 utilities
 - `export/` / `demo.py` — Hydra ExecuTorch export task and inference demo
 - `config/` / `vocabs/` / `datasets/` / `checkpoints/` — configs, vocabularies, data, outputs
 

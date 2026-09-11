@@ -2,7 +2,7 @@
 
 ## 1. Department Overview
 
-The train department builds the two sub-models from hydra configuration and trains them jointly on the preprocessed datasets. It covers the entry point (`main.py`), all configuration (`config/`), the training loop (`tasks/train.py`), the model architecture (`model/`), loss functions (`loss.py`), validation metrics (`metrics/`), and the float8 conversion filter (`utils/float8.py`).
+The train department builds the two sub-models from hydra configuration and trains them jointly on the preprocessed datasets. It covers the entry point (`main.py`), all configuration (`config/`), the training loop (`tasks/train.py`), the model architecture (`model/`), loss functions (`loss/`), validation metrics (`metrics/`), and the float8 conversion filter (`utils/float8.py`).
 
 Training-time data representation (`dataset.py`) is documented in the preprocess department. ExecuTorch export and the inference demo are documented in the export & inference department.
 
@@ -212,7 +212,7 @@ The export task has its own `config/task/export.yaml`; see `export.md`.
 ### `__init__.py`
 - Functionality: re-exports configs, models, layers, RoPE helpers and `kv_cache_write` as the package's public API.
 
-## 6. `loss.py` — Loss Functions
+## 6. `loss/` — Loss Functions
 
 ### `FocalLoss(nn.Module)`
 - Functionality: focal loss for class-imbalanced classification: `FL = -alpha · (1 - p_t)^gamma · log(p_t)`.

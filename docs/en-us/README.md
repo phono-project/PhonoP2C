@@ -18,7 +18,7 @@ The input is therefore "Chinese context + pinyin syllables", and the output is "
 | `subset.py` | extracts a random subset of a corpus into parquet |
 | `tokenizer/` | three-vocabulary tokenizer (chinese / context / pinyin) |
 | `dataset.py` | training-time data transforms, NJT collate, streaming dataset |
-| `loss.py` | loss functions (cross-entropy, focal, mask-aware label smoothing) |
+| `loss/` | loss functions (cross-entropy, focal, mask-aware label smoothing) |
 | `export/` | Hydra task that exports pre/post models to ExecuTorch `.pte` files |
 | `demo.py` | parameterized inference CLI (greedy / beam search) |
 | `tasks/train.py` | Trainer: joint training loop, validation, checkpointing |
@@ -46,7 +46,7 @@ The documentation is organized into three departments (phases of the project lif
 | Department | Document | Covers | Entry points |
 |---|---|---|---|
 | Preprocess | `preprocess.md` | Turning raw text corpora into model-ready samples: `subset.py`, `preprocessor.py`, `tokenizer/`, `vocabs/`, and the data layer of `dataset.py` | `python subset.py`, `python preprocessor.py --preprocess` |
-| Train | `train.md` | Model architecture and the joint training pipeline: `main.py`, `config/`, `tasks/train.py`, `model/`, `loss.py`, `metrics/`, `utils/float8.py` | `python main.py` |
+| Train | `train.md` | Model architecture and the joint training pipeline: `main.py`, `config/`, `tasks/train.py`, `model/`, `loss/`, `metrics/`, `utils/float8.py` | `python main.py` |
 | Export & Inference | `export.md` | ExecuTorch export (`export/`) and the inference demo (`demo.py`) | `python main.py task=export`, `python demo.py` |
 
 ### 3.1 Preprocess department

@@ -2,7 +2,7 @@
 
 ## 1. 部门概述
 
-训练部门根据 hydra 配置构建两个子模型，并在预处理好的数据集上联合训练。 覆盖入口（`main.py`）、全部配置（`config/`）、训练循环（`tasks/train.py`）、 模型架构（`model/`）、损失函数（`loss.py`）、验证指标（`metrics/`）以及 float8 转换过滤（`utils/float8.py`）。
+训练部门根据 hydra 配置构建两个子模型，并在预处理好的数据集上联合训练。 覆盖入口（`main.py`）、全部配置（`config/`）、训练循环（`tasks/train.py`）、 模型架构（`model/`）、损失函数（`loss/`）、验证指标（`metrics/`）以及 float8 转换过滤（`utils/float8.py`）。
 
 训练期的数据表示（`dataset.py`）在预处理部门文档中描述。ExecuTorch 导出和推理演示在导出与推理部门文档中描述。
 
@@ -209,7 +209,7 @@ PyTorch 2.13 中，DDP 与 NJT activation checkpoint 重算组合会为同一 ra
 ### `__init__.py`
 - 功能：重新导出配置、模型、层、RoPE 辅助与 `kv_cache_write` 作为包的公开 API。
 
-## 6. `loss.py` — 损失函数
+## 6. `loss/` — 损失函数
 
 ### `FocalLoss(nn.Module)`
 - 功能：面向类别不均衡的 focal loss： `FL = -alpha · (1 - p_t)^gamma · log(p_t)`。
