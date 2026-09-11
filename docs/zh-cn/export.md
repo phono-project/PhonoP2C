@@ -102,7 +102,7 @@
 
 ## 5. `dicts/` — 校准词典
 
-`dicts/dict_v1.txt` — 按行分隔的大规模中文词表（约 34.9 万词条），用作 解码词典。词必须通过 chinese 词表检查、为多字词、且长度小于 `dict.max_len`（7），才会进入 Trie。由 `tasks/param_search.py` 消费。
+`dicts/dict_v1.txt` — 从 jieba 默认词典派生的、按行分隔的大规模中文词表（约 34.9 万词条），用作解码词典。词必须通过 chinese 词表检查、为多字词、且长度小于 `dict.max_len`（7），才会进入 Trie。由 `tasks/param_search.py` 消费；归属与许可详情见 `THIRD_PARTY_NOTICES.md`。
 
 ## 6. `export.py` — ExecuTorch 导出
 

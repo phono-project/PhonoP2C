@@ -102,7 +102,7 @@ Components:
 
 ## 5. `dicts/` — Calibration Dictionary
 
-`dicts/dict_v1.txt` — a large newline-separated Chinese word list (~349k entries) used as the decoding dictionary. Words must pass the chinese-vocab check, be multi-char, and be shorter than `dict.max_len` (7) before entering the trie. It is consumed by `tasks/param_search.py`.
+`dicts/dict_v1.txt` — a large newline-separated Chinese word list (~349k entries) derived from jieba's default dictionary and used as the decoding dictionary. Words must pass the chinese-vocab check, be multi-char, and be shorter than `dict.max_len` (7) before entering the trie. It is consumed by `tasks/param_search.py`; see `THIRD_PARTY_NOTICES.md` for attribution and license details.
 
 ## 6. `export.py` — ExecuTorch Export
 
