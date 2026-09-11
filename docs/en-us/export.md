@@ -6,7 +6,7 @@ The export & inference department covers everything that happens after training 
 
 - **Decoding calibration** — `tasks/param_search.py` runs the trained model over a validation subset, extracts per-position candidate probabilities, builds a dictionary trie, and uses Optuna to find the best Viterbi decoding priors (`beta_single`, `beta_word`). The algorithms live in `algo/` and the calibration dictionary in `dicts/`.
 - **On-device export** — `export.py` freezes and exports both sub-models to ExecuTorch `.pte` files with XNNPACK dynamic per-channel quantization and shared cross-attention KV cache semantics.
-- **Inference demo** — `demo.py` runs the full pipeline in PyTorch: KV cache allocation, greedy / top-k decoding, and dictionary-constrained Viterbi N-best decoding.
+- **Inference demo** — `demo.py` runs the full pipeline in PyTorch with a parameterized greedy / beam-search CLI.
 
 Components:
 
@@ -17,7 +17,7 @@ Components:
 | Viterbi DP | `algo/viterbi_dp.py` | N-best beam-search decoding with priors |
 | Dictionary asset | `dicts/dict_v1.txt` | Calibration dictionary (multi-char words) |
 | ExecuTorch export | `export.py` | torch.export + XNNPACK quantization -> `.pte` files |
-| Inference demo | `demo.py` | KV-cache inference: greedy, top-k, Viterbi |
+| Inference demo | `demo.py` | Parameterized KV-cache inference: greedy and beam search |
 
 ## 2. `tasks/param_search.py` — Decoding Hyperparameter Search
 
@@ -88,7 +88,7 @@ Components:
 
 #### `find_matching_words(trie, candidates, start)`
 - Functionality: finds every dictionary word that can start at position `start`.
-- Usage: precomputed once per sample by `param_search.py` and computed live by `demo.py`.
+- Usage: precomputed once per sample by `param_search.py`.
 - Behavior: iterative DFS over trie nodes; a word is only extended through characters whose candidate probability at the current position is present and > 0; each completed word is recorded as `(length, word_str, log_prob_sum)`; results are sorted longest-first.
 
 ## 4. `algo/viterbi_dp.py` — Viterbi N-Best Decoding
@@ -97,12 +97,12 @@ Components:
 
 ### `viterbi_nbest(candidates, words_at, beta_single, beta_word, N)`
 - Functionality: returns the top-N segmentations of the candidate sequence.
-- Usage: called by `evaluate_chunk_viterbi` (param search) and by `demo.py` (`predict_step_viterbi`).
+- Usage: called by `evaluate_chunk_viterbi` during parameter search.
 - Behavior: converts candidate probabilities to log space (`-inf` for non-positive); maintains `paths[pos]` as a dict keyed by the decoded prefix string (merging identical prefixes) holding `(score, backpointer node)`; at each position prunes the beam to the top-N unique prefixes; advances single characters and multi-char trie words; at the end sorts the final states, keeps the top-N, and reconstructs word lists via the backpointers. Returns `[(score, words), ...]` sorted by score descending; empty candidate list yields `[(0.0, [])]`; an unreachable end state yields `[]`.
 
 ## 5. `dicts/` — Calibration Dictionary
 
-`dicts/dict_v1.txt` — a large newline-separated Chinese word list (~349k entries) used as the decoding dictionary. Words must pass the chinese-vocab check, be multi-char, and be shorter than `dict.max_len` (7) before entering the trie. Consumed by `tasks/param_search.py`; the produced `dict_trie.json` is consumed by `demo.py`.
+`dicts/dict_v1.txt` — a large newline-separated Chinese word list (~349k entries) used as the decoding dictionary. Words must pass the chinese-vocab check, be multi-char, and be shorter than `dict.max_len` (7) before entering the trie. It is consumed by `tasks/param_search.py`.
 
 ## 6. `export.py` — ExecuTorch Export
 
@@ -126,12 +126,23 @@ Components:
 
 ## 7. `demo.py` — Inference Demo
 
-**Functionality:** Runs the trained pipeline in PyTorch with a self-attention KV cache: greedy decoding, per-position top-k output, and dictionary-constrained Viterbi N-best decoding.
+**Functionality:** Runs the trained pipeline in PyTorch with a self-attention KV cache, using greedy and beam-search decoding.
 
-**Usage:** `python demo.py` runs a hardcoded example (prefix "这难道不会变得很" + pinyin "luan ma"). The module functions are importable for interactive use.
+**Usage:**
 
-### Module constants
-`BETA_SINGLE=0.4636`, `BETA_WORD=0.4839`, `TRIE_PATH=./param_search_output/ dict_trie.json`, `EPSILON=0.001`, `N_BEST=3`.
+```bash
+python demo.py \
+  --checkpoint checkpoints/<run>/final_model \
+  --text "context" \
+  --pinyin pin yin \
+  --beam-size 3 \
+  --device auto \
+  --dtype auto
+```
+
+The checkpoint and pinyin are required. Device and dtype default to CUDA/BF16
+when CUDA is available and CPU/FP32 otherwise. The module functions remain
+importable for interactive use.
 
 ### `load_model_from_checkpoint(checkpoint_dir, device)`
 - Functionality: same loader as `export.py`.
@@ -149,9 +160,9 @@ Components:
 - Functionality: public PyTorch demo wrapper for greedy or top-k generation.
 - Behavior: tokenizes context and pinyin, calls `beam_search`, and returns decoded text or N-best beams. It uses self-KV state only; cross-KV state is not part of the v2 interface.
 
-### `_load_trie_cached(path)`
-- Functionality: lazily loads and caches the trie in a module global.
-- Behavior: loads only once per process.
+### `build_parser()` / `resolve_runtime(device_name, dtype_name)`
+- Functionality: define and validate CLI inputs without embedding a local checkpoint or device in the script.
+- Behavior: resolve `auto` to CUDA/BF16 when available or CPU/FP32 otherwise.
 
-### `__main__` block
-- Behavior: loads the checkpoint and tokenizer, creates caches, runs greedy (`topk=1`), top-5, and Viterbi (`n_best=5`, `epsilon=0.0`) decoding on the example, and prints timing and per-position probability/logit/entropy details.
+### `main(argv=None)`
+- Behavior: loads the selected checkpoint and tokenizer, runs greedy decoding and optional N-best beam search, synchronizes CUDA around timing, and prints decoded hypotheses.

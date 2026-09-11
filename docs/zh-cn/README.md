@@ -20,7 +20,7 @@ PhonoP2C（Fast Pinyin-to-Chinese）是 PhonoP2C-collection 下的一个研究�
 | `dataset.py` | 训练期数据变换、NJT collate、流式数据集 |
 | `loss.py` | 损失函数（交叉熵、focal、掩码感知的 label smoothing） |
 | `export.py` | 将前/后段模型导出为 ExecuTorch .pte 文件 |
-| `demo.py` | 推理演示（greedy / top-k / Viterbi） |
+| `demo.py` | 参数化推理 CLI（greedy / beam search） |
 | `tasks/train.py` | Trainer：联合训练循环、验证、checkpoint |
 | `tasks/param_search.py` | Optuna 搜索 Viterbi 解码先验（beta_single/beta_word） |
 | `model/config.py` | PreModelConfig / PostModelConfig 及 YAML 转配置的构建器 |
@@ -63,7 +63,7 @@ hydra 驱动的联合训练器：根据配置构建两个子模型，由分词�
 
 ### 3.3 导出与推理部门
 
-训练完成后：`param_search.py` 用冻结模型跑验证集子集，抽取每个位置的候选概率，构建词典 Trie，并用 Optuna 搜索 Viterbi 解码先验`beta_single` / `beta_word`；`export.py` 冻结并导出包含两个 pre 方法的多方法程序和 post 编码器为 ExecuTorch`.pte` 文件，采用 XNNPACK 动态逐通道量化；`demo.py` 在 PyTorch 中运行同样的流水线（greedy、top-k、以及词典约束的 Viterbi 解码）。
+训练完成后：`param_search.py` 用冻结模型跑验证集子集，抽取每个位置的候选概率，构建词典 Trie，并用 Optuna 搜索 Viterbi 解码先验`beta_single` / `beta_word`；`export.py` 冻结并导出包含两个 pre 方法的多方法程序和 post 编码器为 ExecuTorch`.pte` 文件，采用 XNNPACK 动态逐通道量化；`demo.py` 在 PyTorch 中提供参数化的 greedy 与 beam-search 推理。
 
 ## 4. 端到端数据流（文字描述）
 
@@ -72,7 +72,7 @@ hydra 驱动的联合训练器：根据配置构建两个子模型，由分词�
 3. **训练** — `main.py` 加载 hydra 配置；`Trainer` 构建分词器、可能性掩码、两个模型，并流式读取 MDS 训练批次。每个批次在线变换（片段选择、拼音增强）后 collate 为 NJT，送入 pre -> post 模型。post 模型的 logits 被可能性掩码过滤后计算损失，两个模型联合优化。验证集为 Arrow 格式，周期性验证。每轮保存 `pre_model` / `post_model` checkpoint。
 4. **解码校准** — `main.py task=param_search` 在验证集子集上推理，保存每个位置的概率候选与词典 Trie，再由 Optuna 搜索 Viterbi N-best 解码的最优 `beta_single` / `beta_word`。
 5. **导出** — `export.py` 加载最终 checkpoint，导出两个 pre 方法和 post 编码器，应用 XNNPACK 动态量化，写出 `pre_model.pte` / `post_model.pte`。
-6. **推理** — `demo.py` 编码拼音一次，再使用带 self-KV Cache 的 pre 条件 pass，用 greedy、top-k 或词典约束的 Viterbi 解码完成拼音转汉字。
+6. **推理** — `demo.py` 编码拼音一次，再使用带 self-KV Cache 的 pre 条件 pass，以 greedy 或 beam search 完成拼音转汉字。
 
 ## 5. 运行环境
 
@@ -84,7 +84,7 @@ hydra 驱动的联合训练器：根据配置构建两个子模型，由分词�
 - `python preprocessor.py --generate_val` — 物化验证集。
 - `python main.py` — 训练（可通过 hydra 覆盖配置，例如 `task=param_search`）。
 - `python export.py` — ExecuTorch 导出。
-- `python demo.py` — 推理演示。
+- `python demo.py --checkpoint <目录> --pinyin <音节...>` — 推理演示。
 
 > **已知问题的临时说明：** 在当前 Python 3.13 环境下，PyTorch 稳定版对于 NJT 的 `torch.compile` 支持存在已知上游漏洞，表现为 `torch._inductor.exc.InductorError: AssertionError` 符号生成错误。
 > 如果您更需要使用 torch.compile 特性，请**按照现在 pixi.toml 默认的状态使用 PyTorch Nightly**，已知 PyTorch Nightly 下可以正常使用 torch.compile 编译该模型。

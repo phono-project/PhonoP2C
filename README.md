@@ -33,7 +33,7 @@ PhonoP2C (Fast Pinyin-to-Chinese) is an end-to-end research project on pinyin-to
 3. `main.py` 联合训练两个子模型（两遍前向），产出 `checkpoints/`（pre / post 分别保存）。
 4. `main.py task=param_search` 用 Optuna 搜索 Viterbi 解码先验。
 5. `export.py` 导出 ExecuTorch .pte 文件（pre 多图程序 / post）。
-6. `demo.py` 演示 greedy / beam / Viterbi 解码。
+6. `demo.py` 提供参数化的 greedy / beam 推理演示。
 
 ## Workflow
 
@@ -42,7 +42,7 @@ PhonoP2C (Fast Pinyin-to-Chinese) is an end-to-end research project on pinyin-to
 3. `main.py` jointly trains both sub-models (two-pass forward), producing `checkpoints/` (pre / post saved individually).
 4. `main.py task=param_search` tunes Viterbi decoding priors with Optuna.
 5. `export.py` exports ExecuTorch `.pte` files (multi-graph pre program / post).
-6. `demo.py` demonstrates greedy / beam / Viterbi decoding.
+6. `demo.py` provides a parameterized greedy / beam inference demo.
 
 ## 运行环境
 
@@ -54,7 +54,7 @@ PhonoP2C (Fast Pinyin-to-Chinese) is an end-to-end research project on pinyin-to
 - `python main.py` — 训练（可通过 hydra 覆盖配置，例如 `task=param_search`）。
 - `python -m pytest tests` — 运行测试。
 - `python export.py` — ExecuTorch 导出（除 .pte 文件外，还会在 `export_output/manifests/` 生成每模型与合并的算子/精度清单，供 phono-core 选择性编译裁剪内核；路径由 export.py 头部的 `MANIFEST_DIR` 常量控制）。
-- `python demo.py` — 推理演示。
+- `python demo.py --checkpoint <目录> --text <上下文> --pinyin <音节...>` — 推理演示。
 
 > **已知问题的临时说明：** 在当前 Python 3.13 环境下，PyTorch 稳定版对于 NJT 的 `torch.compile` 支持存在已知上游漏洞，表现为 `torch._inductor.exc.InductorError: AssertionError` 符号生成错误。
 > 如果您更需要使用 torch.compile 特性，请**按照现在 pixi.toml 默认的状态使用 PyTorch Nightly**，已知 PyTorch Nightly 下可以正常使用 torch.compile 编译该模型。
@@ -70,7 +70,7 @@ The project uses pixi (`pixi.toml`): Python 3.13, CUDA 13 runtime, PyTorch cu130
 - `python main.py` — train (config overridable via hydra, e.g. `task=param_search`).
 - `python -m pytest tests` — run the test suite.
 - `python export.py` — ExecuTorch export (besides the .pte files, per-model and merged operator/dtype manifests are written to `export_output/manifests/` for phono-core's selective build; the output path is controlled by the `MANIFEST_DIR` constant at the top of export.py).
-- `python demo.py` — inference demo.
+- `python demo.py --checkpoint <dir> --text <context> --pinyin <syllables...>` — inference demo.
 
 > **Temporary note on known issues:** In the current Python 3.13 environment, the stable version of PyTorch has a known upstream bug regarding support for NJT’s `torch.compile`, which manifests as a symbol generation error `torch._inductor.exc.InductorError: AssertionError`.
 > If you require the `torch.compile` feature, please **use PyTorch Nightly as is currently the default in pixi.toml**; it is known that `torch.compile` works correctly when compiling this model with PyTorch Nightly.

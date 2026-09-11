@@ -6,7 +6,7 @@
 
 - **解码校准** — `tasks/param_search.py` 在验证集子集上运行训练好的模型， 抽取每个位置的候选概率，构建词典 Trie，并用 Optuna 搜索最优的 Viterbi 解码先验（`beta_single`、`beta_word`）。算法位于 `algo/`，校准词典位于 `dicts/`。
 - **设备端导出** — `export.py` 冻结并导出两个子模型为 ExecuTorch `.pte` 文件，采用 XNNPACK 动态逐通道量化，并保留共享交叉注意力 KV Cache 语义。
-- **推理演示** — `demo.py` 在 PyTorch 中运行完整流水线：KV Cache 分配、 greedy / top-k 解码、以及词典约束的 Viterbi N-best 解码。
+- **推理演示** — `demo.py` 通过参数化 CLI 在 PyTorch 中运行完整的 greedy / beam-search 流水线。
 
 组件清单：
 
@@ -17,7 +17,7 @@
 | Viterbi DP | `algo/viterbi_dp.py` | 带先验的 N-best 束搜索解码 |
 | 词典资产 | `dicts/dict_v1.txt` | 校准词典（多字词） |
 | ExecuTorch 导出 | `export.py` | torch.export + XNNPACK 量化 -> `.pte` 文件 |
-| 推理演示 | `demo.py` | KV Cache 推理：greedy、top-k、Viterbi |
+| 推理演示 | `demo.py` | 参数化 KV Cache 推理：greedy 与 beam search |
 
 ## 2. `tasks/param_search.py` — 解码超参数搜索
 
@@ -88,7 +88,7 @@
 
 #### `find_matching_words(trie, candidates, start)`
 - 功能：查找可以从 `start` 位置起始的全部词典词。
-- 用法：`param_search.py` 对每个样本预计算一次；`demo.py` 在线计算。
+- 用法：`param_search.py` 对每个样本预计算一次。
 - 行为：对 Trie 节点做迭代 DFS；词只能经由在当前候选字典中存在且概率 > 0 的字符延伸；每个完成的词记录为 `(length, word_str, log_prob_sum)`；结果 按长度降序排列。
 
 ## 4. `algo/viterbi_dp.py` — Viterbi N-Best 解码
@@ -97,12 +97,12 @@
 
 ### `viterbi_nbest(candidates, words_at, beta_single, beta_word, N)`
 - 功能：返回候选序列的 top-N 切分。
-- 用法：由 `evaluate_chunk_viterbi`（参数搜索）与 `demo.py` （`predict_step_viterbi`）调用。
+- 用法：由参数搜索中的 `evaluate_chunk_viterbi` 调用。
 - 行为：把候选概率转换到对数空间（非正值记 `-inf`）；维护 `paths[pos]`，以已解码前缀字符串为键的字典（合并相同前缀），值为 `(score, 回溯节点)`；每个位置把束裁剪到 top-N 个唯一前缀；同时推进单字 与多字 Trie 词；结束时对最终状态排序，保留 top-N，经回溯节点还原词表。 返回按分数降序的 `[(score, words), ...]`；空候选列表返回 `[(0.0, [])]`；终点不可达时返回 `[]`。
 
 ## 5. `dicts/` — 校准词典
 
-`dicts/dict_v1.txt` — 按行分隔的大规模中文词表（约 34.9 万词条），用作 解码词典。词必须通过 chinese 词表检查、为多字词、且长度小于 `dict.max_len`（7），才会进入 Trie。由 `tasks/param_search.py` 消费；生成 的 `dict_trie.json` 由 `demo.py` 消费。
+`dicts/dict_v1.txt` — 按行分隔的大规模中文词表（约 34.9 万词条），用作 解码词典。词必须通过 chinese 词表检查、为多字词、且长度小于 `dict.max_len`（7），才会进入 Trie。由 `tasks/param_search.py` 消费。
 
 ## 6. `export.py` — ExecuTorch 导出
 
@@ -126,12 +126,22 @@
 
 ## 7. `demo.py` — 推理演示
 
-**功能：** 在 PyTorch 中用 self-attention KV Cache 运行训练好的流水线：greedy 解码、逐位置 top-k 输出、词典约束的 Viterbi N-best 解码。
+**功能：** 在 PyTorch 中用 self-attention KV Cache 运行训练好的 greedy 与 beam-search 流水线。
 
-**用法：** `python demo.py` 运行内置示例（前缀 "这难道不会变得很" + 拼音 "luan ma"）。模块函数也可导入用于交互使用。
+**用法：**
 
-### 模块常量
-`BETA_SINGLE=0.4636`、`BETA_WORD=0.4839`、`TRIE_PATH=./param_search_output/ dict_trie.json`、`EPSILON=0.001`、`N_BEST=3`。
+```bash
+python demo.py \
+  --checkpoint checkpoints/<run>/final_model \
+  --text "上下文" \
+  --pinyin pin yin \
+  --beam-size 3 \
+  --device auto \
+  --dtype auto
+```
+
+checkpoint 与拼音参数必填。设备和精度默认在 CUDA 可用时选择 CUDA/BF16，
+否则选择 CPU/FP32；模块函数仍可导入用于交互调用。
 
 ### `load_model_from_checkpoint(checkpoint_dir, device)`
 - 功能：与 `export.py` 相同的加载器。
@@ -141,20 +151,13 @@
 - 功能：分配推理用 self-attention KV Cache。
 - 行为：分配 `(pre_num_layers, 2, B, pre_max, pre_nheads, pre_head_dim)`，不分配 cross-KV；`beam_search` 负责一次调用中的 cache 生命周期。
 
-### `predict_step(text, pinyin_list, pre_model, post_model, tokenizer, device, pre_kv_cache=None, pre_cross_kv_cache=None, current_seqlen=0, topk=1)`
-- 功能：带 KV Cache 的一次推理步骤。
-- 行为：编码 BOS token 并运行 pre 模型以初始化缓存（自注意力 KV 与交叉 缓存写入）；编码前缀文本（`encode_context`）并从 `current_seqlen` 起再次 运行 pre 模型，更新两个缓存；文本为空时重新以交叉缓存位置 0 编码 BOS， 并把 `current_seqlen` 重置为 1；编码拼音（`encode_pinyin`）后以 `pre_cross_kv_cache` 与 `current_seqlen`（pre 上下文总长度）运行 post 模型；按 `topk` 返回：
-- `topk == 0` — `full_logits` 与新的 `current_seqlen`；
-- `topk == 1` — argmax id、经 `ids_to_text` 解码的字符串、 `current_seqlen`；
-- `topk > 1` — 逐位置的 top-k id/字符、概率、logits、逐位置熵，以及 `current_seqlen`。
+### `predict_step(text, pinyin_list, pre_model, post_model, tokenizer, device, topk=1)`
+- 功能：面向 greedy 或 top-k beam generation 的公开 PyTorch 演示包装器。
+- 行为：编码上下文与拼音、调用 `beam_search`，返回解码文本或 N-best beams。
 
-### `predict_step_viterbi(text, pinyin_list, pre_model, post_model, tokenizer, device, pre_kv_cache=None, pre_cross_kv_cache=None, current_seqlen=0, beta_single=BETA_SINGLE, beta_word=BETA_WORD, trie_path=TRIE_PATH, epsilon=EPSILON, n_best=N_BEST)`
-- 功能：带词典约束 Viterbi N-best 解码的推理步骤。
-- 行为：调用 `predict_step(topk=0)`；把完整 logits 转概率；按概率大于 `epsilon` 构建逐位置候选字典（字符经分词器 id->字符映射解析）；加载 Trie （缓存在 `_trie_cache` 中）；逐位置预计算 `find_matching_words`；运行 `viterbi_nbest`；返回 `{nbest: [{score, words, text}], current_seqlen, candidates}`。
+### `build_parser()` / `resolve_runtime(device_name, dtype_name)`
+- 功能：定义并校验 CLI 参数，脚本不再嵌入本地 checkpoint 或设备。
+- 行为：`auto` 在 CUDA 可用时解析为 CUDA/BF16，否则为 CPU/FP32。
 
-### `_load_trie_cached(path)`
-- 功能：惰性加载并缓存 Trie 到模块全局变量。
-- 行为：每个进程只加载一次。
-
-### `__main__` 块
-- 行为：加载 checkpoint 与分词器，创建缓存，在示例上运行 greedy （`topk=1`）、top-5 与 Viterbi（`n_best=5`、`epsilon=0.0`）解码，打印耗时 与逐位置概率/logits/熵详情。
+### `main(argv=None)`
+- 行为：加载指定 checkpoint 与 tokenizer，运行 greedy 和可选的 N-best beam search；计时时同步 CUDA，并打印解码候选。

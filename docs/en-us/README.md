@@ -20,7 +20,7 @@ The input is therefore "Chinese context + pinyin syllables", and the output is "
 | `dataset.py` | training-time data transforms, NJT collate, streaming dataset |
 | `loss.py` | loss functions (cross-entropy, focal, mask-aware label smoothing) |
 | `export.py` | exports pre/post models to ExecuTorch `.pte` files |
-| `demo.py` | interactive inference demo (greedy / top-k / Viterbi) |
+| `demo.py` | parameterized inference CLI (greedy / beam search) |
 | `tasks/train.py` | Trainer: joint training loop, validation, checkpointing |
 | `tasks/param_search.py` | Optuna search of Viterbi decoding priors (beta_single/beta_word) |
 | `model/config.py` | PreModelConfig / PostModelConfig + YAML-to-config builder |
@@ -63,7 +63,7 @@ A hydra-driven joint trainer builds the two sub-models from config, computes the
 
 ### 3.3 Export & Inference department
 
-After training: `param_search.py` runs the frozen model over a validation subset, extracts per-position candidate probabilities, builds a dictionary trie, and uses Optuna to tune the Viterbi decoding priors `beta_single` / `beta_word`. `export.py` freezes and exports a multi-method pre program plus a post encoder to ExecuTorch `.pte` files with XNNPACK dynamic per-channel quantization. `demo.py` runs the same pipeline in PyTorch (greedy, top-k, and trie-constrained Viterbi decoding).
+After training: `param_search.py` runs the frozen model over a validation subset, extracts per-position candidate probabilities, builds a dictionary trie, and uses Optuna to tune the Viterbi decoding priors `beta_single` / `beta_word`. `export.py` freezes and exports a multi-method pre program plus a post encoder to ExecuTorch `.pte` files with XNNPACK dynamic per-channel quantization. `demo.py` provides parameterized greedy and beam-search inference in PyTorch.
 
 ## 4. End-to-End Data Flow (prose)
 
@@ -72,7 +72,7 @@ After training: `param_search.py` runs the frozen model over a validation subset
 3. **Training** — `main.py` loads hydra config; `Trainer` builds the tokenizer, the possibility mask, both models, and streams MDS training batches. Each batch is transformed online (span selection, pinyin augmentation), collated into NJTs, and fed to pre -> post models. The post logits are masked by the possibility mask, the loss is computed, and both models are optimized jointly. Validation runs periodically on the Arrow val set. Checkpoints are saved per epoch as `pre_model` / `post_model` subdirectories.
 4. **Decoding calibration** — `main.py task=param_search` runs inference on a val subset, saves per-position probability candidates and a dictionary trie, then Optuna searches the best `beta_single` / `beta_word` priors for Viterbi N-best decoding.
 5. **Export** — `export.py` loads the final checkpoint, exports the two pre methods and post encoder, applies XNNPACK dynamic quantization, and writes `pre_model.pte` / `post_model.pte`.
-6. **Inference** — `demo.py` encodes pinyin once, then runs the pre decoder's conditional pass with self-KV cache state and decodes with greedy, top-k, or dictionary-constrained Viterbi decoding.
+6. **Inference** — `demo.py` encodes pinyin once, then runs the pre decoder's conditional pass with self-KV cache state and decodes with greedy or beam search.
 
 ## 5. Environment
 
@@ -84,7 +84,7 @@ The project uses pixi (`pixi.toml`): Python 3.13, CUDA 13 runtime, PyTorch cu130
 - `python preprocessor.py --generate_val` — materialize the val dataset.
 - `python main.py` — train (config overridable via hydra, e.g. `task=param_search`).
 - `python export.py` — ExecuTorch export.
-- `python demo.py` — inference demo.
+- `python demo.py --checkpoint <dir> --pinyin <syllables...>` — inference demo.
 
 > **Temporary note on known issues:** In the current Python 3.13 environment, the stable version of PyTorch has a known upstream bug regarding support for NJT’s `torch.compile`, which manifests as a symbol generation error `torch._inductor.exc.InductorError: AssertionError`.
 > If you require the `torch.compile` feature, please **use PyTorch Nightly as is currently the default in pixi.toml**; it is known that `torch.compile` works correctly when compiling this model with PyTorch Nightly.

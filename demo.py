@@ -1,5 +1,5 @@
 """
-PostfixLM inference demo (new-standard encoder-decoder architecture).
+PhonoP2C inference command-line demo.
 
 The inference pipeline:
   1. The pre model (causal decoder) primes its self-attn KV cache with the
@@ -10,31 +10,40 @@ The inference pipeline:
      hidden states, masked logits) generates the target characters, either
      greedily or with beam search.
 
-The viterbi demo reuses the per-position candidate distributions collected
-during beam search and applies dictionary-constrained N-best decoding.
 """
 
+import argparse
 import time
+from pathlib import Path
 
 import torch
 
-from algo.trie import load_trie, find_matching_words
-from algo.viterbi_dp import viterbi_nbest
-from tokenizer import P2CTokenizer
-from model.model import PhonoP2CPreModel, PhonoP2CPostModel
 from model.beam_search import beam_search
+from model.model import PhonoP2CPostModel, PhonoP2CPreModel
+from tokenizer import P2CTokenizer
 
-def load_model_from_checkpoint(checkpoint_dir: str, device: torch.device):
+PROJECT_DIR = Path(__file__).resolve().parent
+DTYPES = {
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+}
+
+
+def load_model_from_checkpoint(checkpoint_dir: str | Path, device: torch.device):
     """Load pre and post models from a checkpoint directory.
 
     The directory should contain:
       pre_model/  — save_pretrained output (config.json + model.safetensors)
       post_model/ — save_pretrained output (config.json + model.safetensors)
     """
-    import os
-
-    pre_path = os.path.join(checkpoint_dir, "pre_model")
-    post_path = os.path.join(checkpoint_dir, "post_model")
+    checkpoint_dir = Path(checkpoint_dir).expanduser()
+    pre_path = checkpoint_dir / "pre_model"
+    post_path = checkpoint_dir / "post_model"
+    if not pre_path.is_dir() or not post_path.is_dir():
+        raise FileNotFoundError(
+            f"{checkpoint_dir} must contain pre_model/ and post_model/ directories"
+        )
 
     pre_model = PhonoP2CPreModel.from_pretrained(pre_path).to(device)
     post_model = PhonoP2CPostModel.from_pretrained(post_path).to(device)
@@ -42,6 +51,72 @@ def load_model_from_checkpoint(checkpoint_dir: str, device: torch.device):
     pre_model.eval()
     post_model.eval()
     return pre_model, post_model
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        required=True,
+        help="checkpoint directory containing pre_model/ and post_model/",
+    )
+    parser.add_argument(
+        "--vocab-config",
+        type=Path,
+        default=PROJECT_DIR / "vocabs" / "config.yaml",
+        help="tokenizer vocabulary configuration",
+    )
+    parser.add_argument(
+        "--text",
+        default="",
+        help="Chinese context prefix (defaults to an empty prefix)",
+    )
+    parser.add_argument(
+        "--pinyin",
+        nargs="+",
+        required=True,
+        metavar="SYLLABLE",
+        help="space-separated pinyin syllables to decode",
+    )
+    parser.add_argument(
+        "--beam-size",
+        type=int,
+        default=3,
+        help="number of beam-search hypotheses (default: 3)",
+    )
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="PyTorch device such as cpu, cuda, or cuda:1 (default: auto)",
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=("auto", *DTYPES),
+        default="auto",
+        help="model dtype (default: bfloat16 on CUDA, float32 on CPU)",
+    )
+    return parser
+
+
+def resolve_runtime(device_name: str, dtype_name: str) -> tuple[torch.device, torch.dtype]:
+    if device_name == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(device_name)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is not available")
+
+    if dtype_name == "auto":
+        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    else:
+        dtype = DTYPES[dtype_name]
+    return device, dtype
+
+
+def synchronize(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 @torch.no_grad()
@@ -96,50 +171,56 @@ def predict_step(
     }
 
 
-# Demo
-if __name__ == "__main__":
-    device = torch.device("cpu")
-    dtype = torch.float32
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
+    if args.beam_size <= 0:
+        raise ValueError("--beam-size must be positive")
 
-    checkpoint_dir = "./checkpoints/v2_0-base-alpha05/final_model"
-    n_best = 3
-
-    # Load tokenizer
-    tokenizer = P2CTokenizer.from_config("./vocabs/config.yaml")
+    device, dtype = resolve_runtime(args.device, args.dtype)
+    tokenizer = P2CTokenizer.from_config(str(args.vocab_config.expanduser()))
 
     pre_model, post_model = load_model_from_checkpoint(
-        checkpoint_dir=checkpoint_dir,
-        device=device
+        checkpoint_dir=args.checkpoint,
+        device=device,
     )
     pre_model.to(dtype)
     post_model.to(dtype)
 
-    # Test inference
-    text = "这真的不会"
-    pinyin_list = "luan ma".split()  # expected "乱吗" not "乱码"
+    print(f"Device: {device}, dtype: {dtype}")
+    print(f"Prefix: {args.text!r}")
+    print(f"Pinyin: {args.pinyin}")
 
-    print(f"\nPrefix: '{text}'")
-    print(f"Pinyin: {pinyin_list}")
-
+    synchronize(device)
     start = time.perf_counter_ns()
     result = predict_step(
-        text, pinyin_list,
+        args.text,
+        args.pinyin,
         pre_model, post_model, tokenizer, device,
         topk=1,
     )
+    synchronize(device)
     elapsed = (time.perf_counter_ns() - start) / 1e9
     print(f"Greedy: ids={result['pred_ids']}, decoded='{result['decoded']}'")
-    print(f"Time: {elapsed:.4f}s")
-    
+    print(f"Greedy time: {elapsed:.4f}s")
+
+    if args.beam_size == 1:
+        return
+
+    synchronize(device)
     start = time.perf_counter_ns()
-    # Beam search top-k
-    result5 = predict_step(
-        text, pinyin_list,
+    beam_result = predict_step(
+        args.text,
+        args.pinyin,
         pre_model, post_model, tokenizer, device,
-        topk=n_best,
+        topk=args.beam_size,
     )
+    synchronize(device)
     elapsed = (time.perf_counter_ns() - start) / 1e9
-    print(f"\nTop-5 beams:")
-    for rank, entry in enumerate(result5["nbest"]):
-        print(f"  [{rank+1}] score={entry['score']:.4f} '{entry['decoded']}'")
-    print(F"Time: {elapsed:.4f}s")
+    print(f"Top-{args.beam_size} beams:")
+    for rank, entry in enumerate(beam_result["nbest"], start=1):
+        print(f"  [{rank}] score={entry['score']:.4f} {entry['decoded']!r}")
+    print(f"Beam-search time: {elapsed:.4f}s")
+
+
+if __name__ == "__main__":
+    main()
