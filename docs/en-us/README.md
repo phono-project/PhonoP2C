@@ -81,9 +81,7 @@ The project uses pixi (`pixi.toml`): Python 3.13, CUDA 13 runtime, PyTorch cu130
 - `python main.py task=export` — ExecuTorch export.
 - `python demo.py --checkpoint <dir> --pinyin <syllables...>` — inference demo.
 
-> **Temporary note on known issues:** In the current Python 3.13 environment, the stable version of PyTorch has a known upstream bug regarding support for NJT’s `torch.compile`, which manifests as a symbol generation error `torch._inductor.exc.InductorError: AssertionError`.
-> If you require the `torch.compile` feature, please **use PyTorch Nightly as is currently the default in pixi.toml**; it is known that `torch.compile` works correctly when compiling this model with PyTorch Nightly.
-> If you prefer to use the stable release, you can set `compile_model` to `false` in `config/task/train.yaml`.
+> **Temporary note on known issues:** In the current Python 3.13 environment, the stable version of PyTorch has a known upstream bug regarding support for NJT’s `torch.compile`, which manifests as a symbol generation error `torch._inductor.exc.InductorError: AssertionError`. If you require the `torch.compile` feature, please **use PyTorch Nightly as is currently the default in pixi.toml**; it is known that `torch.compile` works correctly when compiling this model with PyTorch Nightly. If you prefer to use the stable release, you can set `compile_model` to `false` in `config/task/train.yaml`.
 
 ## 6. Reading Guide
 

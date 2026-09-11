@@ -28,22 +28,9 @@ Training uses native PyTorch DDP and is launched with `torchrun`:
 pixi run torchrun --standalone --nproc-per-node=4 main.py
 ```
 
-`task.batchsize` is per GPU, so the global batch size is
-`task.batchsize * world_size`. Mosaic `StreamingDataset` partitions training
-samples from the torchrun environment and must not be wrapped in another
-`DistributedSampler`. Validation is partitioned exactly, without padding or
-duplicates; every rank runs forward evaluation and beam search before the
-token-weighted losses and all metrics are reduced. Only rank 0 writes W&B,
-progress, and checkpoints.
+`task.batchsize` is per GPU, so the global batch size is `task.batchsize * world_size`. Mosaic `StreamingDataset` partitions training samples from the torchrun environment and must not be wrapped in another `DistributedSampler`. Validation is partitioned exactly, without padding or duplicates; every rank runs forward evaluation and beam search before the token-weighted losses and all metrics are reduced. Only rank 0 writes W&B, progress, and checkpoints.
 
-Training losses are likewise weighted by the global number of valid tokens on
-all ranks, so variable-length NJT batches have the same DDP reduction semantics
-as one process consuming the combined global batch. With the current PyTorch
-2.13 build, combining DDP with NJT activation-checkpoint recomputation assigns
-different symbolic IDs to the same ragged dimension. The trainer therefore
-disables gradient checkpointing only under DDP. This compatibility measure does
-not change the model, attention, offsets, or loss; it only uses more activation
-memory and avoids recomputation. Single-process behavior remains config-driven.
+Training losses are likewise weighted by the global number of valid tokens on all ranks, so variable-length NJT batches have the same DDP reduction semantics as one process consuming the combined global batch. With the current PyTorch 2.13 build, combining DDP with NJT activation-checkpoint recomputation assigns different symbolic IDs to the same ragged dimension. The trainer therefore disables gradient checkpointing only under DDP. This compatibility measure does not change the model, attention, offsets, or loss; it only uses more activation memory and avoids recomputation. Single-process behavior remains config-driven.
 
 **Behavior:**
 

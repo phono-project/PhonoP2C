@@ -81,9 +81,7 @@ hydra 驱动的联合训练器：根据配置构建两个子模型，由分词�
 - `python main.py task=export` — ExecuTorch 导出。
 - `python demo.py --checkpoint <目录> --pinyin <音节...>` — 推理演示。
 
-> **已知问题的临时说明：** 在当前 Python 3.13 环境下，PyTorch 稳定版对于 NJT 的 `torch.compile` 支持存在已知上游漏洞，表现为 `torch._inductor.exc.InductorError: AssertionError` 符号生成错误。
-> 如果您更需要使用 torch.compile 特性，请**按照现在 pixi.toml 默认的状态使用 PyTorch Nightly**，已知 PyTorch Nightly 下可以正常使用 torch.compile 编译该模型。
-> 如果您更需要使用稳定版，可在 `config/task/train.yaml` 中将 `compile_model` 设置为 `false`。
+> **已知问题的临时说明：** 在当前 Python 3.13 环境下，PyTorch 稳定版对于 NJT 的 `torch.compile` 支持存在已知上游漏洞，表现为 `torch._inductor.exc.InductorError: AssertionError` 符号生成错误。如果您更需要使用 torch.compile 特性，请**按照现在 pixi.toml 默认的状态使用 PyTorch Nightly**，已知 PyTorch Nightly 下可以正常使用 torch.compile 编译该模型。如果您更需要使用稳定版，可在 `config/task/train.yaml` 中将 `compile_model` 设置为 `false`。
 
 ## 6. 阅读指南
 
