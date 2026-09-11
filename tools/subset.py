@@ -1,5 +1,5 @@
 """
-subset.py — dataset subset extractor
+tools/subset.py — dataset subset extractor
 Extracts a random subset of a dataset and saves it as parquet.
 """
 

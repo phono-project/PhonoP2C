@@ -15,7 +15,7 @@ The input is therefore "Chinese context + pinyin syllables", and the output is "
 |---|---|
 | `main.py` | Hydra entry point; dispatches train / preprocess tasks |
 | `preprocessor.py` | preprocessing pipeline: raw corpus to MDS / Arrow datasets |
-| `subset.py` | extracts a random subset of a corpus into parquet |
+| `tools/subset.py` | extracts a random subset of a corpus into parquet |
 | `tokenizer/` | three-vocabulary tokenizer (chinese / context / pinyin) |
 | `dataset.py` | training-time data transforms, NJT collate, streaming dataset |
 | `loss/` | loss functions (cross-entropy, focal, mask-aware label smoothing) |
@@ -45,13 +45,13 @@ The documentation is organized into three departments (phases of the project lif
 
 | Department | Document | Covers | Entry points |
 |---|---|---|---|
-| Preprocess | `preprocess.md` | Turning raw text corpora into model-ready samples: `subset.py`, `preprocessor.py`, `tokenizer/`, `vocabs/`, and the data layer of `dataset.py` | `python subset.py`, `python preprocessor.py --preprocess` |
+| Preprocess | `preprocess.md` | Turning raw text corpora into model-ready samples: `tools/subset.py`, `preprocessor.py`, `tokenizer/`, `vocabs/`, and the data layer of `dataset.py` | `python tools/subset.py`, `python preprocessor.py --preprocess` |
 | Train | `train.md` | Model architecture and the joint training pipeline: `main.py`, `config/`, `tasks/train.py`, `model/`, `loss/`, `metrics/`, `utils/float8.py` | `python main.py` |
 | Export & Inference | `export.md` | ExecuTorch export (`export/`) and the inference demo (`demo.py`) | `python main.py task=export`, `python demo.py` |
 
 ### 3.1 Preprocess department
 
-Raw corpora (JSONL, plain text, parquet) are normalized (traditional to simplified Chinese, NFKC, emoji stripping, context-vocab filtering), split into runs of Chinese / pause-punctuation / non-Chinese segments, sliced into samples of bounded length, and annotated with nested per-character pinyin readings. The train split is written to MDS (MosaicML StreamingDataset) format in parallel, the validation split is written to HF Arrow format with prefix/suffix/pinyin materialized. `subset.py` is a helper that extracts a random sub-corpus (used e.g. to build a smaller fineweb subset).
+Raw corpora (JSONL, plain text, parquet) are normalized (traditional to simplified Chinese, NFKC, emoji stripping, context-vocab filtering), split into runs of Chinese / pause-punctuation / non-Chinese segments, sliced into samples of bounded length, and annotated with nested per-character pinyin readings. The train split is written to MDS (MosaicML StreamingDataset) format in parallel, the validation split is written to HF Arrow format with prefix/suffix/pinyin materialized. `tools/subset.py` is a helper that extracts a random sub-corpus (used e.g. to build a smaller fineweb subset).
 
 ### 3.2 Train department
 
@@ -63,7 +63,7 @@ After training, the `export` task freezes and exports a multi-method pre program
 
 ## 4. End-to-End Data Flow (prose)
 
-1. **Corpus acquisition** — It is recommended to store raw data in `datasets/pretrain_base`. The data processor supports data in JSONL / Parquet formats from sources such as LCCC, MMC, CLUE, Wikipedia, Zhihu-KOL, and FineWeb. For very large corpora, using `subset.py` to extract a subset is recommended.
+1. **Corpus acquisition** — It is recommended to store raw data in `datasets/pretrain_base`. The data processor supports data in JSONL / Parquet formats from sources such as LCCC, MMC, CLUE, Wikipedia, Zhihu-KOL, and FineWeb. For very large corpora, using `tools/subset.py` to extract a subset is recommended.
 2. **Preprocessing** — `preprocessor.py` normalizes each text, segments it, slices samples of 16–64 characters, computes nested per-character pinyin, and writes `datasets/pretrain_v2/train` (MDS, zstd) plus `datasets/pretrain_v2/val` (HF Arrow with materialized prefix/suffix/pinyin pairs).
 3. **Training** — `main.py` loads hydra config; `Trainer` builds the tokenizer, the possibility mask, both models, and streams MDS training batches. Each batch is transformed online (span selection, pinyin augmentation), collated into NJTs, and fed to pre -> post models. The post logits are masked by the possibility mask, the loss is computed, and both models are optimized jointly. Validation runs periodically on the Arrow val set. Checkpoints are saved per epoch as `pre_model` / `post_model` subdirectories.
 4. **Export** — `main.py task=export` loads the configured checkpoint, exports the pre methods and post encoder, applies the configured XNNPACK quantization, and writes `pre_model.pte` / `post_model.pte`.
@@ -74,7 +74,7 @@ After training, the `export` task freezes and exports a multi-method pre program
 The project uses pixi (`pixi.toml`): Python 3.13, CUDA 13 runtime, PyTorch cu130 build, plus jieba, pypinyin, zhconv-rs, streaming (MosaicML), datasets, hydra-core, wandb, netcal, torchao, bitsandbytes, executorch, and quality tools (black, isort, flake8, mypy). Typical workflow commands:
 
 - `pixi install` / `pixi run python ...` to run any script.
-- `python subset.py` — build a corpus subset.
+- `python tools/subset.py` — build a corpus subset.
 - `python preprocessor.py --preprocess` — full preprocessing.
 - `python preprocessor.py --generate_val` — materialize the val dataset.
 - `python main.py` — train (configuration can be overridden via Hydra).

@@ -12,7 +12,7 @@ The department comprises:
 
 | Component | File | Role |
 |---|---|---|
-| Corpus subsetter | `subset.py` | Extract a random subset of a large corpus into parquet |
+| Corpus subsetter | `tools/subset.py` | Extract a random subset of a large corpus into parquet |
 | Main pipeline | `preprocessor.py` | Normalize, segment, sample, annotate pinyin, write train/val datasets |
 | Tokenizer | `tokenizer/` | Three-vocabulary tokenizer; encoding/decoding; pinyin->Chinese possibility map |
 | Vocabulary assets | `vocabs/` | chinese_vocab.txt, context_vocab.txt, pinyin_vocab.txt, config.yaml |
@@ -20,11 +20,11 @@ The department comprises:
 
 `dataset.py` is described here because it is the data-representation layer; the train department consumes it (see `train.md`).
 
-## 2. `subset.py` — Corpus Subset Extractor
+## 2. `tools/subset.py` — Corpus Subset Extractor
 
 **Functionality:** A standalone helper that extracts a random subset of an existing dataset (HF `save_to_disk` directory or parquet file/directory) and saves it as parquet shards. Used to build smaller working corpora, e.g. the fineweb subset consumed by `preprocessor.py`.
 
-**Usage:** Run directly: `python subset.py`. Configuration is via module constants: `INPUT_PATH`, `OUTPUT_PATH`, `INPUT_FORMAT` (`"hf"` or `"parquet"`), `SUBSET_SIZE` (fraction or absolute row count), `SEED` (default 114514), `NUM_SHARDS` (default 20).
+**Usage:** Run directly: `python tools/subset.py`. Configuration is via module constants: `INPUT_PATH`, `OUTPUT_PATH`, `INPUT_FORMAT` (`"hf"` or `"parquet"`), `SUBSET_SIZE` (fraction or absolute row count), `SEED` (default 114514), `NUM_SHARDS` (default 20).
 
 ### Functions
 

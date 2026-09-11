@@ -12,7 +12,7 @@
 
 | 组件 | 文件 | 职责 |
 |---|---|---|
-| 语料子集抽取 | `subset.py` | 从大语料中抽取随机子集并输出 parquet |
+| 语料子集抽取 | `tools/subset.py` | 从大语料中抽取随机子集并输出 parquet |
 | 主流水线 | `preprocessor.py` | 规范化、分段、采样、拼音标注，写出训练/验证集 |
 | 分词器 | `tokenizer/` | 三词表分词器；编码/解码；拼音->汉字可能性掩码 |
 | 词表资产 | `vocabs/` | chinese_vocab.txt、context_vocab.txt、pinyin_vocab.txt、config.yaml |
@@ -20,11 +20,11 @@
 
 `dataset.py` 在此处描述，因为它是数据表示层；训练部门消费它（见 `train.md`）。
 
-## 2. `subset.py` — 语料子集抽取器
+## 2. `tools/subset.py` — 语料子集抽取器
 
 **功能：** 独立的辅助工具：从已有数据集（HF `save_to_disk` 目录或 parquet 文件/目录）中抽取随机子集并保存为 parquet 分片。用于构建较小的可用语料， 例如 `preprocessor.py` 消费的 fineweb 子集。
 
-**用法：** 直接运行：`python subset.py`。配置通过模块常量： `INPUT_PATH`、`OUTPUT_PATH`、`INPUT_FORMAT`（`"hf"` 或 `"parquet"`）、 `SUBSET_SIZE`（比例或绝对行数）、`SEED`（默认 114514）、`NUM_SHARDS` （默认 20）。
+**用法：** 直接运行：`python tools/subset.py`。配置通过模块常量： `INPUT_PATH`、`OUTPUT_PATH`、`INPUT_FORMAT`（`"hf"` 或 `"parquet"`）、 `SUBSET_SIZE`（比例或绝对行数）、`SEED`（默认 114514）、`NUM_SHARDS` （默认 20）。
 
 ### 函数
 
