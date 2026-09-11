@@ -21,7 +21,6 @@ bitsandbytes = "*"
 
 pypinyin = "*"
 netcal = "*"
-optuna = "*"
 zhconv-rs = "*"
 
 transformers = "*"

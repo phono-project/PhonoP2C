@@ -165,8 +165,8 @@ def beam_search(
     """Fixed-length beam search over the chinese vocabulary for one sample.
 
     Thin wrapper around :func:`beam_search_batch` for a single sample.  When
-    ``return_candidates`` is set, per-position candidate distributions (used by
-    the demo's Viterbi path) are additionally computed on CPU.
+    ``return_candidates`` is set, per-position candidate distributions are
+    additionally computed on CPU.
 
     Returns ``(scores, ids)`` (``[beam_width]`` / ``[beam_width, T]``), or
     ``((scores, ids), candidates)`` when ``return_candidates`` is set.

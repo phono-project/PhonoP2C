@@ -211,7 +211,7 @@ The tokenizer is built from `vocabs/config.yaml` (`P2CTokenizer.from_config`).
 
 It also builds the pinyin->Chinese **possibility map** used to mask impossible post-model logits.
 
-**Usage:** `P2CTokenizer.from_config("vocabs/config.yaml")`; in `preprocessor.py` (filtering), `dataset.py` (encoding), `tasks/train.py` (sizes + mask), `tasks/param_search.py`, `demo.py`, `export.py`.
+**Usage:** `P2CTokenizer.from_config("vocabs/config.yaml")`; in `preprocessor.py` (filtering), `dataset.py` (encoding), `tasks/train.py` (sizes + mask), `demo.py`, and `export.py`.
 
 ### `_read_vocab_tokens(path)`
 - Functionality: reads a unigram vocab file (one token per line).
@@ -269,7 +269,7 @@ The `\n` literal in a line encodes a real newline token (see `_read_vocab_tokens
 
 **Functionality:** The training-time data representation: online sample transforms (span selection + pinyin augmentation), an NJT collate function, and a streaming dataset wrapper over the MDS training split. It also reproduces the segmentation label constants used by `preprocessor.py`.
 
-**Usage:** Imported by `tasks/train.py` (transforms, collate, streaming dataset, `create_dataset`) and by `tasks/param_search.py` (collate, `create_dataset`, val transform).
+**Usage:** Imported by `tasks/train.py` for transforms, collate, streaming datasets, and validation dataset loading.
 
 ### Constants
 `PAUSE_LABEL=0`, `CHINESE_LABEL=1`, `NON_CHINESE_LABEL=2` — must match `preprocessor.py`. Pinyin-augmentation sets: `_COMP_CONSONANTS` (`zh/ch/sh`), `_ALL_INITIALS` (all simple initials).

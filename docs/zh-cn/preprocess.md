@@ -211,7 +211,7 @@
 
 它还构建用于过滤 post 模型非法 logits 的拼音->汉字**可能性掩码**。
 
-**用法：** `P2CTokenizer.from_config("vocabs/config.yaml")`；被 `preprocessor.py`（过滤）、`dataset.py`（编码）、`tasks/train.py`（词表 大小 + 掩码）、`tasks/param_search.py`、`demo.py`、`export.py` 使用。
+**用法：** `P2CTokenizer.from_config("vocabs/config.yaml")`；被 `preprocessor.py`（过滤）、`dataset.py`（编码）、`tasks/train.py`（词表大小 + 掩码）、`demo.py`、`export.py` 使用。
 
 ### `_read_vocab_tokens(path)`
 - 功能：读取 unigram 词表文件（每行一个 token）。
@@ -269,7 +269,7 @@
 
 **功能：** 训练期的数据表示：在线样本变换（片段选择 + 拼音增强）、NJT collate 函数、以及 MDS 训练集的流式数据集封装。它也复用了 `preprocessor.py` 的分段标签常量。
 
-**用法：** 被 `tasks/train.py`（变换、collate、流式数据集、`create_dataset`） 与 `tasks/param_search.py`（collate、`create_dataset`、验证变换）导入。
+**用法：** 被 `tasks/train.py` 用于变换、collate、流式训练集和验证数据集加载。
 
 ### 常量
 `PAUSE_LABEL=0`、`CHINESE_LABEL=1`、`NON_CHINESE_LABEL=2` — 必须与 `preprocessor.py` 一致。拼音增强集合：`_COMP_CONSONANTS`（`zh/ch/sh`）、 `_ALL_INITIALS`（全部简拼声母）。

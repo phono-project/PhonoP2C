@@ -4,7 +4,7 @@
 
 训练部门根据 hydra 配置构建两个子模型，并在预处理好的数据集上联合训练。 覆盖入口（`main.py`）、全部配置（`config/`）、训练循环（`tasks/train.py`）、 模型架构（`model/`）、损失函数（`loss.py`）、验证指标（`metrics/`）以及 float8 转换过滤（`utils/float8.py`）。
 
-训练期的数据表示（`dataset.py`）在预处理部门文档中描述；解码参数搜索 （`tasks/param_search.py`）在导出与推理部门文档中描述。
+训练期的数据表示（`dataset.py`）在预处理部门文档中描述。ExecuTorch 导出和推理演示在导出与推理部门文档中描述。
 
 训练流水线的关键特征：
 
@@ -18,7 +18,7 @@
 
 **功能：** hydra 装饰的入口 （`@hydra.main(version_base=None, config_path="config", config_name="config")`）。 加载完整配置，应用全局运行时设置，并分发到指定的任务运行器。
 
-**用法：** `python main.py`（训练，按 `config/task/train.yaml`），或 `python main.py task=param_search`（并附加任务级覆盖，见 `export.md`）。
+**用法：** `python main.py`（训练，按 `config/task/train.yaml`），或 `python main.py task=preprocess`（预处理）。
 
 ### 单机多卡 DDP
 
@@ -49,7 +49,7 @@ PyTorch 2.13 中，DDP 与 NJT activation checkpoint 重算组合会为同一 ra
 - `system.tf32_enabled` 时启用 matmul 与 cudnn 的 TF32。
 - `system.set_seed` 时可选地固定 CPU/GPU 随机种子（默认 42）。
 - 设置 `torch.set_float32_matmul_precision("high")` 并关闭 inductor FX graph cache（NJT 兼容性）。
-- 分发：`task_type == "param_search"` -> `ParamSearchRunner`；其余 -> `Trainer.train()`。
+- 分发预处理到 `run_preprocess`；训练使用 `Trainer.train()`。
 
 ## 3. `config/` — hydra 配置
 
@@ -78,9 +78,6 @@ PyTorch 2.13 中，DDP 与 NJT activation checkpoint 重算组合会为同一 ra
 ### `config/output/default.yaml` — 输出行为
 - `progress_bar`：条宽、刷新率、已用/剩余时间、速度、比例列、 `transient: true`。
 - `logging.log_level: "ERROR"`（或 `DEFAULT`）。
-
-### `config/task/param_search.yaml` — 解码校准
-见 `export.md`（由 `main.py task=param_search` 使用）。
 
 ## 4. `tasks/train.py` — Trainer
 

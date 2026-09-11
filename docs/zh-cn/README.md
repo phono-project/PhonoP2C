@@ -13,7 +13,7 @@ PhonoP2C（Fast Pinyin-to-Chinese）是 PhonoP2C-collection 下的一个研究�
 
 | 路径 | 用途 |
 |---|---|
-| `main.py` | hydra 入口；分发 train / param_search 两类任务 |
+| `main.py` | Hydra 入口；分发 train / preprocess 任务 |
 | `preprocessor.py` | 预处理流水线：原始语料转 MDS / Arrow 数据集 |
 | `subset.py` | 从语料中抽取随机子集并输出 parquet |
 | `tokenizer.py` | 三词表分词器（chinese / context / pinyin） |
@@ -22,7 +22,6 @@ PhonoP2C（Fast Pinyin-to-Chinese）是 PhonoP2C-collection 下的一个研究�
 | `export.py` | 将前/后段模型导出为 ExecuTorch .pte 文件 |
 | `demo.py` | 参数化推理 CLI（greedy / beam search） |
 | `tasks/train.py` | Trainer：联合训练循环、验证、checkpoint |
-| `tasks/param_search.py` | Optuna 搜索 Viterbi 解码先验（beta_single/beta_word） |
 | `model/config.py` | PreModelConfig / PostModelConfig 及 YAML 转配置的构建器 |
 | `model/model.py` | PhonoP2CPreModel / PhonoP2CPostModel |
 | `model/attn.py` | MHSALayer（自注意力）/ MHCALayer（交叉注意力） |
@@ -30,13 +29,10 @@ PhonoP2C（Fast Pinyin-to-Chinese）是 PhonoP2C-collection 下的一个研究�
 | `model/moe.py` | MoE_EC_FFN（expert-choice MoE 前馈，可选） |
 | `model/utils.py` | RoPE（RotaryEmbedding）辅助函数、局部位置 id |
 | `model/custom_ops.py` | 自定义 torch.library KV Cache 更新算子（导出友好） |
-| `algo/trie.py` | Trie 构建 / 加载 / 词典词匹配 |
-| `algo/viterbi_dp.py` | Viterbi DP N-best 束搜索解码 |
 | `metrics/accumulator.py` | ACC / Top-k ACC / Sentence-ACC / Adaptive ECE 累加器 |
 | `utils/float8.py` | torchao float8 训练转换的模块过滤函数 |
 | `config/` | hydra 配置（model、dataset、task、system、logging、output） |
 | `vocabs/` | chinese / context / pinyin 词表及 config.yaml |
-| `dicts/` | 解码用校准词典（dict_v1.txt 来源于 jieba） |
 | `datasets/` | 原始语料（位于 pretrain_base）与生成的数据集（pretrain_v2） |
 | `checkpoints/` | 训练输出（pre_model / post_model 子目录） |
 | `pixi.toml` | pixi 环境定义（Python 3.13、CUDA 13、torch cu130） |
@@ -51,7 +47,7 @@ PhonoP2C（Fast Pinyin-to-Chinese）是 PhonoP2C-collection 下的一个研究�
 |---|---|---|---|
 | 预处理 | `preprocess.md` | 原始语料转模型样本：`subset.py`、`preprocessor.py`、`tokenizer.py`、`vocabs/`，以及 `dataset.py` 的数据层 | `python subset.py`、`python preprocessor.py --preprocess` |
 | 训练 | `train.md` | 模型架构与联合训练流水线：`main.py`、`config/`、`tasks/train.py`、`model/`、`loss.py`、`metrics/`、`utils/float8.py` | `python main.py` |
-| 导出与推理 | `export.md` | 训练后的各阶段：解码校准（`tasks/param_search.py`、`algo/`、`dicts/`）、设备端导出（`export.py`）、推理演示（`demo.py`） | `python main.py task=param_search ...`、`python export.py`、`python demo.py` |
+| 导出与推理 | `export.md` | ExecuTorch 导出（`export.py`）与推理演示（`demo.py`） | `python export.py`、`python demo.py` |
 
 ### 3.1 预处理部门
 
@@ -63,26 +59,25 @@ hydra 驱动的联合训练器：根据配置构建两个子模型，由分词�
 
 ### 3.3 导出与推理部门
 
-训练完成后：`param_search.py` 用冻结模型跑验证集子集，抽取每个位置的候选概率，构建词典 Trie，并用 Optuna 搜索 Viterbi 解码先验`beta_single` / `beta_word`；`export.py` 冻结并导出包含两个 pre 方法的多方法程序和 post 编码器为 ExecuTorch`.pte` 文件，采用 XNNPACK 动态逐通道量化；`demo.py` 在 PyTorch 中提供参数化的 greedy 与 beam-search 推理。
+训练完成后，`export.py` 冻结并导出包含多个 pre 方法的程序和 post 编码器为 ExecuTorch `.pte` 文件，采用 XNNPACK 动态逐通道量化；`demo.py` 在 PyTorch 中提供参数化的 greedy 与 beam-search 推理。
 
 ## 4. 端到端数据流（文字描述）
 
 1. **语料获取** — 原始数据建议存放于 `datasets/pretrain_base`，数据处理器支持 LCCC、MMC、CLUE、wikipedia、zhihu-kol、fineweb 等 JSONL、Parquet 格式的数据。超大语料可先用 `subset.py` 抽取子集。
 2. **预处理** — `preprocessor.py` 规范化每条文本，分段，切成 16–64 字符的样本，计算嵌套的逐字拼音，输出 `datasets/pretrain_v2/train`（MDS，默认zstd压缩）和 `datasets/pretrain_v2/val`（HF Arrow，物化 prefix/suffix/pinyin 对）。
 3. **训练** — `main.py` 加载 hydra 配置；`Trainer` 构建分词器、可能性掩码、两个模型，并流式读取 MDS 训练批次。每个批次在线变换（片段选择、拼音增强）后 collate 为 NJT，送入 pre -> post 模型。post 模型的 logits 被可能性掩码过滤后计算损失，两个模型联合优化。验证集为 Arrow 格式，周期性验证。每轮保存 `pre_model` / `post_model` checkpoint。
-4. **解码校准** — `main.py task=param_search` 在验证集子集上推理，保存每个位置的概率候选与词典 Trie，再由 Optuna 搜索 Viterbi N-best 解码的最优 `beta_single` / `beta_word`。
-5. **导出** — `export.py` 加载最终 checkpoint，导出两个 pre 方法和 post 编码器，应用 XNNPACK 动态量化，写出 `pre_model.pte` / `post_model.pte`。
-6. **推理** — `demo.py` 编码拼音一次，再使用带 self-KV Cache 的 pre 条件 pass，以 greedy 或 beam search 完成拼音转汉字。
+4. **导出** — `export.py` 加载最终 checkpoint，导出 pre 方法和 post 编码器，应用 XNNPACK 动态量化，写出 `pre_model.pte` / `post_model.pte`。
+5. **推理** — `demo.py` 编码拼音一次，再使用带 self-KV Cache 的 pre 条件 pass，以 greedy 或 beam search 完成拼音转汉字。
 
 ## 5. 运行环境
 
-项目使用 pixi（`pixi.toml`）：Python 3.13、CUDA 13 runtime、cu130 版 PyTorch，以及 jieba、pypinyin、zhconv-rs、streaming（MosaicML）、datasets、hydra-core、wandb、optuna、netcal、torchao、bitsandbytes、executorch 和代码质量工具（black、isort、flake8、mypy）。常用命令：
+项目使用 pixi（`pixi.toml`）：Python 3.13、CUDA 13 runtime、cu130 版 PyTorch，以及 jieba、pypinyin、zhconv-rs、streaming（MosaicML）、datasets、hydra-core、wandb、netcal、torchao、bitsandbytes、executorch 和代码质量工具（black、isort、flake8、mypy）。常用命令：
 
 - `pixi install` / `pixi run python ...` 运行任意脚本。
 - `python subset.py` — 构建语料子集。
 - `python preprocessor.py --preprocess` — 完整预处理。
 - `python preprocessor.py --generate_val` — 物化验证集。
-- `python main.py` — 训练（可通过 hydra 覆盖配置，例如 `task=param_search`）。
+- `python main.py` — 训练（可通过 Hydra 覆盖配置）。
 - `python export.py` — ExecuTorch 导出。
 - `python demo.py --checkpoint <目录> --pinyin <音节...>` — 推理演示。
 

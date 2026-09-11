@@ -6,52 +6,48 @@ PhonoP2C (Fast Pinyin-to-Chinese) is an end-to-end research project on pinyin-to
 
 ## 项目结构
 
-- `main.py` / `tasks/` — hydra 入口与训练、预处理、解码校准任务
+- `main.py` / `tasks/` — Hydra 入口与训练、预处理任务
 - `datasets_pipeline/` — 数据层（`dataset.py`、`preprocessor.py`）与共享组件（`constants.py`、`pinyin.py`、`segments.py`）
 - `subset.py` / `tokenizer.py` — 语料子集抽取与三词表 tokenizer（含 `sample_heteronym` 异读采样）
 - `model/` — 解码器 / 编码器、注意力、SwiGLU、MoE、RoPE、KV Cache 自定义算子、`beam_search.py`
 - `loss.py` / `metrics/` / `utils/` — 损失、评估指标（含 beam search Top-K 句准确率）与 float8 工具
-- `algo/` — Trie 词典匹配与 Viterbi N-best 解码
 - `export.py` / `demo.py` — ExecuTorch 导出与推理演示
-- `config/` / `vocabs/` / `dicts/` / `datasets/` / `checkpoints/` — 配置、词表、词典、数据与产出
+- `config/` / `vocabs/` / `datasets/` / `checkpoints/` — 配置、词表、数据与产出
 
 ## Project Layout
 
-- `main.py` / `tasks/` — hydra entry point and train / preprocess / decoding-calibration tasks
+- `main.py` / `tasks/` — Hydra entry point and train / preprocess tasks
 - `datasets_pipeline/` — data layer (`dataset.py`, `preprocessor.py`) and shared components (`constants.py`, `pinyin.py`, `segments.py`)
 - `subset.py` / `tokenizer.py` — corpus subsetting and the three-vocabulary tokenizer (incl. `sample_heteronym`)
 - `model/` — decoder / encoder, attention, SwiGLU, MoE, RoPE, custom KV-cache ops, `beam_search.py`
 - `loss.py` / `metrics/` / `utils/` — losses, metrics (incl. beam-search Top-K sentence accuracy), float8 utilities
-- `algo/` — trie dictionary matching and Viterbi N-best decoding
 - `export.py` / `demo.py` — ExecuTorch export and inference demo
-- `config/` / `vocabs/` / `dicts/` / `datasets/` / `checkpoints/` — configs, vocabularies, dictionaries, data, outputs
+- `config/` / `vocabs/` / `datasets/` / `checkpoints/` — configs, vocabularies, data, outputs
 
 ## 工作流
 
 1. 语料放入 `datasets/pretrain_base`，可选先用 `subset.py` 抽取子集。
 2. `python main.py task=preprocess`（或 `python -m datasets_pipeline.preprocessor --preprocess`）将语料规范化为 MDS / Arrow 数据集（`datasets/pretrain_v2`），并统计字-音频率写入 `vocabs/characters_pronounce_frequency.json`。
 3. `main.py` 联合训练两个子模型（两遍前向），产出 `checkpoints/`（pre / post 分别保存）。
-4. `main.py task=param_search` 用 Optuna 搜索 Viterbi 解码先验。
-5. `export.py` 导出 ExecuTorch .pte 文件（pre 多图程序 / post）。
-6. `demo.py` 提供参数化的 greedy / beam 推理演示。
+4. `export.py` 导出 ExecuTorch .pte 文件（pre 多图程序 / post）。
+5. `demo.py` 提供参数化的 greedy / beam 推理演示。
 
 ## Workflow
 
 1. Put raw corpora in `datasets/pretrain_base`; optionally extract a subset with `subset.py` first.
 2. `python main.py task=preprocess` (or `python -m datasets_pipeline.preprocessor --preprocess`) normalizes corpora into MDS / Arrow datasets (`datasets/pretrain_v2`) and writes per-character pronunciation frequencies to `vocabs/characters_pronounce_frequency.json`.
 3. `main.py` jointly trains both sub-models (two-pass forward), producing `checkpoints/` (pre / post saved individually).
-4. `main.py task=param_search` tunes Viterbi decoding priors with Optuna.
-5. `export.py` exports ExecuTorch `.pte` files (multi-graph pre program / post).
-6. `demo.py` provides a parameterized greedy / beam inference demo.
+4. `export.py` exports ExecuTorch `.pte` files (multi-graph pre program / post).
+5. `demo.py` provides a parameterized greedy / beam inference demo.
 
 ## 运行环境
 
-项目使用 pixi（`pixi.toml`）：Python 3.13、CUDA 13 runtime、cu130 版 PyTorch，以及 jieba、pypinyin、zhconv-rs、streaming（MosaicML）、datasets、hydra-core、wandb、optuna、netcal、torchao、bitsandbytes、executorch 和代码质量工具（black、isort、flake8、mypy）。常用命令：
+项目使用 pixi（`pixi.toml`）：Python 3.13、CUDA 13 runtime、cu130 版 PyTorch，以及 jieba、pypinyin、zhconv-rs、streaming（MosaicML）、datasets、hydra-core、wandb、netcal、torchao、bitsandbytes、executorch 和代码质量工具（black、isort、flake8、mypy）。常用命令：
 
 - `pixi install` / `pixi run python ...` 运行任意脚本。
 - `python subset.py` — 构建语料子集。
 - `python main.py task=preprocess` — 完整预处理（配置见 `config/dataset/pretrain_v2.yaml`）。
-- `python main.py` — 训练（可通过 hydra 覆盖配置，例如 `task=param_search`）。
+- `python main.py` — 训练（可通过 Hydra 覆盖配置）。
 - `python -m pytest tests` — 运行测试。
 - `python export.py` — ExecuTorch 导出（除 .pte 文件外，还会在 `export_output/manifests/` 生成每模型与合并的算子/精度清单，供 phono-core 选择性编译裁剪内核；路径由 export.py 头部的 `MANIFEST_DIR` 常量控制）。
 - `python demo.py --checkpoint <目录> --text <上下文> --pinyin <音节...>` — 推理演示。
@@ -62,12 +58,12 @@ PhonoP2C (Fast Pinyin-to-Chinese) is an end-to-end research project on pinyin-to
 
 ## Environment
 
-The project uses pixi (`pixi.toml`): Python 3.13, CUDA 13 runtime, PyTorch cu130 build, plus jieba, pypinyin, zhconv-rs, streaming (MosaicML), datasets, hydra-core, wandb, optuna, netcal, torchao, bitsandbytes, executorch, and quality tools (black, isort, flake8, mypy). Typical workflow commands:
+The project uses pixi (`pixi.toml`): Python 3.13, CUDA 13 runtime, PyTorch cu130 build, plus jieba, pypinyin, zhconv-rs, streaming (MosaicML), datasets, hydra-core, wandb, netcal, torchao, bitsandbytes, executorch, and quality tools (black, isort, flake8, mypy). Typical workflow commands:
 
 - `pixi install` / `pixi run python ...` to run any script.
 - `python subset.py` — build a corpus subset.
 - `python main.py task=preprocess` — full preprocessing (config in `config/dataset/pretrain_v2.yaml`).
-- `python main.py` — train (config overridable via hydra, e.g. `task=param_search`).
+- `python main.py` — train (configuration can be overridden via Hydra).
 - `python -m pytest tests` — run the test suite.
 - `python export.py` — ExecuTorch export (besides the .pte files, per-model and merged operator/dtype manifests are written to `export_output/manifests/` for phono-core's selective build; the output path is controlled by the `MANIFEST_DIR` constant at the top of export.py).
 - `python demo.py --checkpoint <dir> --text <context> --pinyin <syllables...>` — inference demo.
@@ -82,7 +78,7 @@ The project uses pixi (`pixi.toml`): Python 3.13, CUDA 13 runtime, PyTorch cu130
 
 - [预处理部门（preprocess.md）](docs/zh-cn/preprocess.md) — `subset.py`、`datasets_pipeline/preprocessor.py`、`tokenizer.py`、数据层
 - [训练部门（train.md）](docs/zh-cn/train.md) — 模型架构、`main.py`、hydra 配置、Trainer、损失与指标
-- [导出与推理部门（export.md）](docs/zh-cn/export.md) — 解码校准、ExecuTorch 导出、推理演示
+- [导出与推理部门（export.md）](docs/zh-cn/export.md) — ExecuTorch 导出与推理演示
 
 详细中文文档见 [docs/zh-cn/](docs/zh-cn/README.md)。
 
@@ -92,7 +88,7 @@ The project documentation is organized into three departments — preprocess, tr
 
 - [Preprocess department (preprocess.md)](docs/en-us/preprocess.md) — `subset.py`, `datasets_pipeline/preprocessor.py`, `tokenizer.py`, data layer
 - [Train department (train.md)](docs/en-us/train.md) — model architecture, `main.py`, hydra configs, Trainer, losses and metrics
-- [Export & Inference department (export.md)](docs/en-us/export.md) — decoding calibration, ExecuTorch export, inference demo
+- [Export & Inference department (export.md)](docs/en-us/export.md) — ExecuTorch export and inference demo
 
 Detailed documentations can be found at [docs/en-us/](docs/en-us/README.md).
 
@@ -100,13 +96,10 @@ Detailed documentations can be found at [docs/en-us/](docs/en-us/README.md).
 
 由于本人精力有限，而且文档大部分使用了 LLM 生成，不可避免的会存在纰漏、更新不及时等问题。如果发现有任何问题，欢迎提出 issues。
 
-本项目基于 Apache License 2.0 开源，详见 [LICENSE](LICENSE)。随仓库分发的
-第三方资产及其许可信息见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+本项目基于 Apache License 2.0 开源，详见 [LICENSE](LICENSE)。
 
 ## License and Final Note
 
 Due to my limited time and resources, and since most of this documentation was generated by an LLM, there may inevitably be errors or outdated information. If you find any issues, please feel free to open an issue.
 
-Open-sourced under the Apache License 2.0; see [LICENSE](LICENSE). Attribution
-and license details for bundled third-party assets are listed in
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Open-sourced under the Apache License 2.0; see [LICENSE](LICENSE).

@@ -60,10 +60,6 @@ def main(cfg: DictConfig) -> None:
 
             dataset_cfg = OmegaConf.to_container(cfg.dataset, resolve=True)
             run_preprocess(dataset_cfg, generate_val=cfg.task.get("generate_val", True))
-        elif task_name == "param_search":
-            from tasks.param_search import ParamSearchRunner
-            runner = ParamSearchRunner(cfg)
-            runner.run()
         else:
             from tasks.train import Trainer
             trainer = Trainer(cfg, distributed)

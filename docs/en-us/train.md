@@ -4,7 +4,7 @@
 
 The train department builds the two sub-models from hydra configuration and trains them jointly on the preprocessed datasets. It covers the entry point (`main.py`), all configuration (`config/`), the training loop (`tasks/train.py`), the model architecture (`model/`), loss functions (`loss.py`), validation metrics (`metrics/`), and the float8 conversion filter (`utils/float8.py`).
 
-Training-time data representation (`dataset.py`) is documented in the preprocess department; the decoding-parameter search (`tasks/param_search.py`) is documented in the export & inference department.
+Training-time data representation (`dataset.py`) is documented in the preprocess department. ExecuTorch export and the inference demo are documented in the export & inference department.
 
 Key properties of the training pipeline:
 
@@ -18,7 +18,7 @@ Key properties of the training pipeline:
 
 **Functionality:** The hydra-decorated entry point (`@hydra.main(version_base=None, config_path="config", config_name="config")`). Loads the full configuration, applies global runtime settings, and dispatches to the requested task runner.
 
-**Usage:** `python main.py` (train, per `config/task/train.yaml`), or `python main.py task=param_search` (plus task-specific overrides, see `export.md`).
+**Usage:** `python main.py` (train, per `config/task/train.yaml`) or `python main.py task=preprocess` (preprocessing).
 
 ### Single-node multi-GPU DDP
 
@@ -52,7 +52,7 @@ memory and avoids recomputation. Single-process behavior remains config-driven.
 - Enables TF32 for matmul and cudnn when `system.tf32_enabled`.
 - Optionally seeds CPU/GPU when `system.set_seed` (default seed 42).
 - Sets `torch.set_float32_matmul_precision("high")` and disables the inductor FX graph cache (NJT incompatibility).
-- Dispatches: `task_type == "param_search"` -> `ParamSearchRunner`; anything else -> `Trainer.train()`.
+- Dispatches preprocessing to `run_preprocess`; training uses `Trainer.train()`.
 
 ## 3. `config/` — Hydra Configuration
 
@@ -81,9 +81,6 @@ memory and avoids recomputation. Single-process behavior remains config-driven.
 ### `config/output/default.yaml` — output behavior
 - `progress_bar`: bar width, refresh rate, time elapsed/remaining, speed, ratio columns, `transient: true`.
 - `logging.log_level: "ERROR"` (or `DEFAULT`).
-
-### `config/task/param_search.yaml` — decoding calibration
-See `export.md` (used by `main.py task=param_search`).
 
 ## 4. `tasks/train.py` — Trainer
 
