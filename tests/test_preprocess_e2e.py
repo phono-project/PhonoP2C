@@ -77,12 +77,32 @@ def e2e_config(tmp_path, tiny_corpus):
     }
 
 
-def test_run_preprocess_end_to_end(e2e_config, tmp_path):
+def test_run_preprocess_end_to_end(e2e_config, tmp_path, monkeypatch):
+    import datasets_pipeline.preprocessor as preprocessor
     from datasets_pipeline.preprocessor import run_preprocess
     from datasets import Dataset
     from tokenizer import P2CTokenizer
 
+    # Simulate a previous run's table. The tokenizer used for validation must
+    # see the newly counted table, rather than merely writing it to disk.
+    freq_path = os.path.join(os.path.dirname(e2e_config["vocabs_config"]),
+                             "characters_pronounce_frequency.json")
+    with open(freq_path, "w", encoding="utf-8") as f:
+        json.dump({"长": {"zhang": 1.0}}, f)
+    original_prepare = preprocessor._prepare_val_batch
+    observed = []
+
+    def checked_prepare(batch, tokenizer, config):
+        with open(freq_path, encoding="utf-8") as f:
+            saved = json.load(f)
+        assert tokenizer.character_pinyin_frequency == saved
+        assert saved != {"长": {"zhang": 1.0}}
+        observed.append(True)
+        return original_prepare(batch, tokenizer, config)
+
+    monkeypatch.setattr(preprocessor, "_prepare_val_batch", checked_prepare)
     run_preprocess(e2e_config, generate_val=True)
+    assert observed, "the validation materializer must exercise the refreshed tokenizer"
 
     # train MDS index written
     train_index = tmp_path / "datasets" / "train" / "index.json"

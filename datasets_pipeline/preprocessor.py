@@ -760,6 +760,10 @@ def run_preprocess(cfg: dict, generate_val: bool = True):
     # them as a part of the tokenizer.
     freq = count_character_pinyins(ds)
     freq_path = save_character_pinyin_frequency(freq, vocabs_config)
+    # Validation is materialized by this same tokenizer. It was constructed
+    # before counting, so explicitly replace any previously loaded frequency
+    # table with the artifact just written for this run.
+    tokenizer.load_character_pinyin_frequency(freq_path)
     print(f"Character pinyin frequencies -> {freq_path} ({len(freq)} chars)")
 
     total_chars = count_characters(ds, proc["num_proc"])
